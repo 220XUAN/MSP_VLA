@@ -16,6 +16,7 @@ from openpi.shared import normalize as _normalize
 from openpi.training import config as _config
 
 from XPolicyLab.model_template import ModelTemplate
+from XPolicyLab.utils.checkpoint_resolver import candidate_checkpoint_roots
 from XPolicyLab.utils.process_data import (
     decode_image_bit,
     get_robot_action_dim_info,
@@ -37,14 +38,17 @@ def _extract_step_number(value: Any) -> int | None:
 
 
 def _resolve_pi05_model_root(model_cfg: dict[str, Any]) -> Path:
-    ckpt_name = model_cfg.get("ckpt_name")
-    if not ckpt_name:
-        model_path = model_cfg.get("model_path") or model_cfg.get("checkpoint_path")
-        if model_path is None:
-            raise ValueError("ckpt_name or model_path is required for Pi_05.")
-        return Path(model_path).expanduser().resolve()
-
-    checkpoint_root = (_CHECKPOINTS_DIR / str(ckpt_name)).expanduser().resolve()
+    # Shared precedence: model_path/checkpoint_path keys > ckpt_name-as-path >
+    # {bench}-{ckpt}-{env}-{action}-{seed} concat > checkpoints/<ckpt_name>.
+    candidates = candidate_checkpoint_roots(
+        model_cfg,
+        _CHECKPOINTS_DIR,
+        policy_dir=_POLICY_DIR,
+        explicit_keys=("model_path", "checkpoint_path"),
+    )
+    if not candidates:
+        raise ValueError("ckpt_name or model_path is required for Pi_05.")
+    checkpoint_root = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
     if not checkpoint_root.is_dir():
         return checkpoint_root
 
