@@ -303,6 +303,27 @@ class MspActionVAE(_model.BaseModel):
         return recon_loss + self.kl_weight * kl_loss[:, None]
 
     @override
+    def compute_loss_with_info(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
+        del observation
+        sample_rng, dropout_rng = jax.random.split(rng)
+        recon, mean, logvar = self.action_vae(actions, sample_rng, train=train, rngs=nnx.Rngs(dropout=dropout_rng))
+        recon_loss = jnp.mean(jnp.abs(recon - actions), axis=-1)
+        kl_loss = 0.5 * jnp.sum(jnp.square(mean) + jnp.exp(logvar) - 1.0 - logvar, axis=(1, 2))
+        weighted_kl_loss = self.kl_weight * kl_loss[:, None]
+        total_loss = recon_loss + weighted_kl_loss
+        return total_loss, {
+            "recon_loss": jnp.mean(recon_loss),
+            "kl_loss": jnp.mean(weighted_kl_loss),
+        }
+
+    @override
     def sample_actions(self, rng: at.KeyArrayLike, observation: _model.Observation, **kwargs) -> _model.Actions:
         del kwargs
         batch_size = observation.state.shape[0]

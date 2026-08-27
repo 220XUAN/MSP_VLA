@@ -146,7 +146,10 @@ class ActionOnlyLeRobotDataset(Dataset):
             video_backend=data_config.video_backend,
         )
         column_names = list(dict.fromkeys([*data_config.action_sequence_keys, "episode_index"]))
-        self._dataset = dataset.select_columns(column_names)
+        if hasattr(dataset, "hf_dataset"):
+            self._dataset = dataset.hf_dataset.select_columns(column_names)
+        else:
+            self._dataset = dataset.select_columns(column_names)
         self._action_sequence_keys = tuple(data_config.action_sequence_keys)
         self._action_horizon = action_horizon
 

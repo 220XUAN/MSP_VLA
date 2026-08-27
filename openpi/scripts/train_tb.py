@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
@@ -48,27 +48,14 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
-
+def init_tensorboard(config: _config.TrainConfig) -> SummaryWriter:
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
-
-    if log_code:
-        wandb.run.log_code(epath.Path(__file__).parent.parent)
+    log_dir = ckpt_dir / "tensorboard"
+    writer = SummaryWriter(log_dir=str(log_dir))
+    writer.add_text("config", repr(dataclasses.asdict(config)))
+    return writer
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -222,7 +209,7 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    tb_writer = init_tensorboard(config)
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -235,11 +222,9 @@ def main(config: _config.TrainConfig):
 
     # Log images from first batch to sanity check.
     if batch[0].images:
-        images_to_log = [
-            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-            for i in range(min(5, len(next(iter(batch[0].images.values())))))
-        ]
-        wandb.log({"camera_views": images_to_log}, step=0)
+        for i in range(min(5, len(next(iter(batch[0].images.values()))))):
+            image = np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1)
+            tb_writer.add_image(f"camera_views/{i}", image, 0, dataformats="HWC")
     else:
         logging.info("No images in first batch; skipping camera view logging.")
 
@@ -275,7 +260,8 @@ def main(config: _config.TrainConfig):
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            for k, v in reduced_info.items():
+                tb_writer.add_scalar(k, float(v), step)
             infos = []
         batch = next(data_iter)
 
@@ -284,6 +270,7 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    tb_writer.close()
 
 
 if __name__ == "__main__":

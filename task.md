@@ -811,6 +811,177 @@ Stage-2 训练命令：
 - 真实 pi0.5 checkpoint 加载回归
 - 真实训练验证
 
+## 2026-08-27 本轮实现：Stage-1 VAE 暴露 `recon_loss` 和加权 `kl_loss` 到训练日志
+
+需求：
+- `openpi/src/openpi/models/msp_vae.py` 里的 `MspActionVAE.compute_loss()` 目前只返回总 loss
+- 现在还需要把两个关键指标暴露到 `openpi/scripts/train.py` 做可视化：
+  - `recon_loss`
+  - `self.kl_weight * kl_loss[:, None]`
+- 这两个指标不参与梯度，只用于日志
+
+本轮修改文件：
+- `openpi/src/openpi/models/model.py`
+- `openpi/src/openpi/models/msp_vae.py`
+- `openpi/scripts/train.py`
+- `task.md`
+
+### 1. 在 `BaseModel` 增加兼容接口
+
+新增：
+- `BaseModel.compute_loss_with_info(...)`
+
+默认行为：
+- 返回 `(compute_loss(...), {})`
+
+这样普通模型不用改：
+- `Pi0`
+- `Pi0Fast`
+- 以及其他任何只关心总 loss 的模型
+
+### 2. `MspActionVAE` 覆盖 `compute_loss_with_info`
+
+实现：
+- 保留原来的 `compute_loss()`，继续只返回总 loss，避免破坏现有接口
+- 新增 `compute_loss_with_info()`：
+  - 复用同一套前向
+  - 计算：
+    - `recon_loss`
+    - `weighted_kl_loss = self.kl_weight * kl_loss[:, None]`
+    - `total_loss = recon_loss + weighted_kl_loss`
+  - 返回：
+    - `total_loss`
+    - `{"recon_loss": mean(recon_loss), "kl_loss": mean(weighted_kl_loss)}`
+
+这里日志里记录的 `kl_loss` 是：
+- **已经乘过 `kl_weight` 的 KL 项**
+- 对应你提的 `self.kl_weight * kl_loss[:, None]`
+
+### 3. `train.py` 改为通过 `has_aux=True` 接收额外指标
+
+训练步现在做的是：
+- `loss_fn()` 返回 `(mean(chunked_loss), metric_info)`
+- `nnx.value_and_grad(..., has_aux=True)` 同时拿到：
+  - 总 loss
+  - 梯度
+  - 附加 metrics
+- 最终 `info` 里除了原来的：
+  - `loss`
+  - `grad_norm`
+  - `param_norm`
+- 还会在 `MspActionVAE` 路径下额外包含：
+  - `recon_loss`
+  - `kl_loss`
+
+这样 wandb / 日志侧不需要额外改格式，按现有 `wandb.log(reduced_info, step=step)` 就会自动打出去。
+
+### 4. 本轮验证
+
+已通过：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/model.py openpi/src/openpi/models/msp_vae.py openpi/scripts/train.py`
+- `git diff --check -- openpi/src/openpi/models/model.py openpi/src/openpi/models/msp_vae.py openpi/scripts/train.py task.md`
+
+## 2026-08-27 本轮实现：`train_tb.py` 去掉 wandb，改用 TensorBoard
+
+需求：
+- `openpi/scripts/train_tb.py` 是从 `train.py` 复制出来的训练脚本
+- 现在要求删掉 `wandb`，改用 TensorBoard
+
+本轮修改文件：
+- `openpi/scripts/train_tb.py`
+- `task.md`
+
+实现内容：
+- 删除 `import wandb`
+- 改为：
+  - `from torch.utils.tensorboard import SummaryWriter`
+- 删除 `init_wandb(...)`
+- 新增 `init_tensorboard(config)`：
+  - 日志目录使用 `config.checkpoint_dir / "tensorboard"`
+  - 启动时写一份 `config` 文本到 TensorBoard
+
+日志改动：
+- 标量日志：
+  - 原来的 `wandb.log(reduced_info, step=step)`
+  - 改成 `tb_writer.add_scalar(key, value, step)`
+- 首批图像可视化：
+  - 原来的 `wandb.Image(...)` + `wandb.log(...)`
+  - 改成 `tb_writer.add_image(..., dataformats="HWC")`
+
+恢复训练逻辑：
+- 保留了原本的 `resuming` 路径
+- `initialize_checkpoint_dir(...)` 返回 `resuming=True` 时，仍然会调用：
+  - `_checkpoints.restore_state(...)`
+
+收尾：
+- 训练结束时调用 `tb_writer.close()`
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/scripts/train_tb.py`
+- `git diff --check -- openpi/scripts/train_tb.py task.md`
+
+## 2026-08-27 本轮修正：`ActionOnlyLeRobotDataset` 的 `select_columns` 走 `hf_dataset`
+
+需求：
+- 用户指出 `openpi/src/openpi/training/data_loader.py` 里的：
+  - `self._dataset = dataset.select_columns(column_names)`
+- 更可能应该走：
+  - `dataset.hf_dataset.select_columns(...)`
+
+本轮修改文件：
+- `openpi/src/openpi/training/data_loader.py`
+- `task.md`
+
+实现：
+- 改成兼容写法：
+  - 如果 `dataset` 有 `hf_dataset` 属性，则优先用：
+    - `dataset.hf_dataset.select_columns(column_names)`
+  - 否则 fallback 到旧写法：
+    - `dataset.select_columns(column_names)`
+
+这样做的原因：
+- `LeRobotDataset` 往往是外层包装对象
+- `select_columns` 更常见于其内部的 HuggingFace dataset
+- 但为了兼容不同版本的 LeRobot，这里不把代码写死成单一路径
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/training/data_loader.py`
+- `git diff --check -- openpi/src/openpi/training/data_loader.py task.md`
+
+## 2026-08-27 README 补充：第二阶段训练启动方式
+
+需求：
+- 把 MSP 第二阶段怎么启动训练写到 `README.md`
+
+本轮修改文件：
+- `README.md`
+- `task.md`
+
+补充内容：
+- 在 Training 段落后新增 `MSP Stage 2` 小节
+- 明确写了第二阶段训练前需要准备：
+  - Stage-1 的 VAE checkpoint
+  - Stage-2 用的 LeRobot 数据集
+- 给出了最小启动命令
+- 补了两个常见变体：
+  - 显式指定 `OPENPI_LEROBOT_REPO_ID`
+  - 显式指定 `OPENPI_TRAIN_CONFIG_NAME`
+- 补了多卡启动示例
+- 说明了第二阶段的关键行为：
+  - 不是 action-only
+  - 会加载 pi0.5 预训练权重
+  - 会额外合并 Stage-1 的 `msp_action_vae` 权重
+
+## 2026-08-27 Git 同步记录
+
+当前用户要求：
+- 把现在这版 `Pi_05` 代码同步到 GitHub
+
+本次同步范围：
+- 提交当前仓库里已修改的 `Pi_05` 代码
+- 包括新建的 `openpi/scripts/train_tb.py`
+- 不包含未跟踪的 `MSP/` 参考目录
+
 ## 2026-08-27 Git 操作记录
 
 当前用户要求：
@@ -819,3 +990,25 @@ Stage-2 训练命令：
 本次提交范围判断：
 - 只提交 `policy/Pi_05` 下这次 MSP 接入相关修改
 - 不把未跟踪的 `policy/Pi_05/MSP/` 参考目录一起提交，避免把本地参考实现混入本次适配提交
+
+执行结果：
+- 本地提交：
+  - commit: `c9f81f9`
+  - message: `Add MSP two-stage integration for Pi_05`
+- 新增远端：
+  - `msp_vla -> https://github.com/220XUAN/MSP_VLA.git`
+- 已推送：
+  - `main -> msp_vla/main`
+
+修正说明：
+- 上一次 push 的 commit 文件范围虽然只涉及 `policy/Pi_05`，但推送对象是上层 `XPolicyLab` 仓库的 `main`。
+- 这会把整个上层仓库历史带到 `220XUAN/MSP_VLA.git`，不符合“只提交当前 `Pi_05`”的要求。
+- 下一步需要把远端 `msp_vla/main` 改写成仅包含 `policy/Pi_05` 子目录内容的分支。
+
+修正结果：
+- 已通过 `git subtree split --prefix=policy/Pi_05 -b pi05_only` 生成只包含 `Pi_05` 内容的分支
+- split 分支头：
+  - `0627ca3 Add MSP two-stage integration for Pi_05`
+- 已强制更新远端：
+  - `pi05_only -> msp_vla/main`
+- 现在 `220XUAN/MSP_VLA.git` 的 `main` 应该只包含 `Pi_05` 目录内容，不再包含整个上层 `XPolicyLab`
