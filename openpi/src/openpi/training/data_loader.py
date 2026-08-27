@@ -133,6 +133,52 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class ActionOnlyLeRobotDataset(Dataset):
+    """Materialize action chunks from raw LeRobot rows without decoding images."""
+
+    def __init__(self, data_config: _config.DataConfig, action_horizon: int):
+        repo_id = data_config.repo_id
+        if repo_id is None:
+            raise ValueError("Repo ID is not set. Cannot create action-only dataset.")
+
+        dataset = lerobot_dataset.LeRobotDataset(
+            repo_id,
+            video_backend=data_config.video_backend,
+        )
+        column_names = list(dict.fromkeys([*data_config.action_sequence_keys, "episode_index"]))
+        self._dataset = dataset.select_columns(column_names)
+        self._action_sequence_keys = tuple(data_config.action_sequence_keys)
+        self._action_horizon = action_horizon
+
+    def _flatten_action(self, row: dict) -> np.ndarray:
+        parts = [np.asarray(row[key], dtype=np.float32).reshape(-1) for key in self._action_sequence_keys]
+        return np.concatenate(parts, axis=-1)
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        idx = index.__index__()
+        current_row = self._dataset[idx]
+        episode_index = int(current_row["episode_index"])
+        action_chunk = []
+        last_action = None
+
+        for offset in range(self._action_horizon):
+            next_idx = min(idx + offset, len(self._dataset) - 1)
+            row = self._dataset[next_idx]
+            if int(row["episode_index"]) != episode_index:
+                if last_action is None:
+                    last_action = self._flatten_action(current_row)
+                action = last_action
+            else:
+                action = self._flatten_action(row)
+                last_action = action
+            action_chunk.append(action)
+
+        return {"actions": np.stack(action_chunk, axis=0)}
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -142,6 +188,8 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if data_config.action_only:
+        return ActionOnlyLeRobotDataset(data_config, action_horizon)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -252,6 +300,7 @@ def create_data_loader(
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
+            model_config=config.model,
             action_horizon=config.model.action_horizon,
             batch_size=config.batch_size,
             sharding=sharding,
@@ -341,11 +390,12 @@ def create_torch_data_loader(
         framework=framework,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, data_loader, model_config)
 
 
 def create_rlds_data_loader(
     data_config: _config.DataConfig,
+    model_config: _model.BaseModelConfig,
     action_horizon: int,
     batch_size: int,
     *,
@@ -382,7 +432,7 @@ def create_rlds_data_loader(
         num_batches=num_batches,
     )
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, data_loader, model_config)
 
 
 class TorchDataLoader:
@@ -535,13 +585,40 @@ class RLDSDataLoader:
 
 
 class DataLoaderImpl(DataLoader):
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+    def __init__(
+        self,
+        data_config: _config.DataConfig,
+        data_loader: TorchDataLoader | RLDSDataLoader,
+        model_config: _model.BaseModelConfig,
+    ):
         self._data_config = data_config
         self._data_loader = data_loader
+        self._model_config = model_config
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            if self._data_config.action_only:
+                yield self._make_action_only_observation(batch["actions"]), batch["actions"]
+            else:
+                yield _model.Observation.from_dict(batch), batch["actions"]
+
+    def _make_action_only_observation(self, actions):
+        batch_size = actions.shape[0]
+        action_dim = self._model_config.action_dim
+        if isinstance(actions, torch.Tensor):
+            state = torch.zeros((batch_size, action_dim), dtype=torch.float32, device=actions.device)
+        elif isinstance(actions, np.ndarray):
+            state = np.zeros((batch_size, action_dim), dtype=np.float32)
+        else:
+            state = jnp.zeros((batch_size, action_dim), dtype=jnp.float32)
+
+        return _model.Observation(
+            images={},
+            image_masks={},
+            state=state,
+            tokenized_prompt=None,
+            tokenized_prompt_mask=None,
+        )

@@ -8,6 +8,8 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+import openpi.models.msp_scale_head as msp_scale_head
+from openpi.models.msp_vae import ActionVAELinen
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
@@ -63,10 +65,29 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+def token_posemb_sincos(
+    pos: at.Real[at.Array, " s"], embedding_dim: int, min_period: float, max_period: float
+) -> at.Float[at.Array, "s {embedding_dim}"]:
+    if embedding_dim % 2 != 0:
+        raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
+
+    fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
+    period = min_period * (max_period / min_period) ** fraction
+    sinusoid_input = jnp.einsum(
+        "i,j->ij",
+        pos,
+        1.0 / period * 2 * jnp.pi,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.use_msp_action_head = config.use_msp_action_head
+        self.msp_scales = config.msp_scales
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -98,6 +119,47 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        if self.use_msp_action_head:
+            assert self.msp_scales is not None
+            msp_vae_config = config.make_msp_vae_config()
+            total_msp_tokens = sum(self.msp_scales)
+            self.msp_action_vae = nnx_bridge.ToNNX(
+                ActionVAELinen(
+                    action_dim=msp_vae_config.action_dim,
+                    encoder_dim=msp_vae_config.encoder_dim,
+                    decoder_dim=msp_vae_config.decoder_dim,
+                    skill_block_size=msp_vae_config.action_horizon,
+                    downsample_factor=msp_vae_config.downsample_factor,
+                    attn_pdrop=msp_vae_config.attn_pdrop,
+                    use_causal_encoder=msp_vae_config.use_causal_encoder,
+                    use_causal_decoder=msp_vae_config.use_causal_decoder,
+                    encoder_heads=msp_vae_config.encoder_heads,
+                    encoder_layers=msp_vae_config.encoder_layers,
+                    decoder_heads=msp_vae_config.decoder_heads,
+                    decoder_layers=msp_vae_config.decoder_layers,
+                    latent_dim=msp_vae_config.latent_dim,
+                )
+            )
+            self.msp_action_vae.lazy_init(
+                jnp.ones((1, config.action_horizon, config.action_dim), dtype=jnp.float32),
+                jax.random.key(0),
+                train=False,
+                rngs=rngs,
+            )
+            self.msp_latent_in_proj = nnx.Linear(config.msp_latent_dim, action_expert_config.width, rngs=rngs)
+            self.msp_latent_out_proj = nnx.Linear(action_expert_config.width, config.msp_latent_dim, rngs=rngs)
+            self.msp_scale_embed = nnx.Embed(
+                num_embeddings=len(self.msp_scales),
+                features=action_expert_config.width,
+                rngs=rngs,
+            )
+            init_std = 0.02
+            pos_shape = (1, total_msp_tokens, action_expert_config.width)
+            self.msp_encoder_pos_embed = nnx.Param(jax.random.normal(rngs.params(), pos_shape, dtype=jnp.float32) * init_std)
+            self.msp_decoder_pos_embed = nnx.Param(jax.random.normal(rngs.params(), pos_shape, dtype=jnp.float32) * init_std)
+            self.msp_diffusion_pos_embed = nnx.Param(
+                jax.random.normal(rngs.params(), pos_shape, dtype=jnp.float32) * init_std
+            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -135,6 +197,147 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+
+    def _msp_pos_slice(
+        self,
+        pos_embed: nnx.Param,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        dtype: jnp.dtype,
+    ) -> jnp.ndarray:
+        pos = pos_embed.value
+        if start is not None or end is not None:
+            pos = pos[:, start:end, :]
+        return pos.astype(dtype)
+
+    def _embed_msp_suffix(
+        self,
+        latent_inputs: jnp.ndarray,
+        scales: tuple[int, ...],
+        *,
+        pos_start: int | None = None,
+        pos_end: int | None = None,
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"],
+        at.Bool[at.Array, "b s"],
+        at.Float[at.Array, "b emb"],
+        at.Int[at.Array, "b s"],
+    ]:
+        scale_ids = msp_scale_head.build_scale_ids(scales)
+        action_tokens = self.msp_latent_in_proj(latent_inputs)
+        scale_emb = self.msp_scale_embed(scale_ids)[None, :, :]
+        encoder_pos = self._msp_pos_slice(
+            self.msp_encoder_pos_embed,
+            start=pos_start,
+            end=pos_end,
+            dtype=action_tokens.dtype,
+        )
+        decoder_pos = self._msp_pos_slice(
+            self.msp_decoder_pos_embed,
+            start=pos_start,
+            end=pos_end,
+            dtype=action_tokens.dtype,
+        )
+        tokens = action_tokens + scale_emb + encoder_pos + decoder_pos
+        input_mask = jnp.ones(tokens.shape[:2], dtype=jnp.bool_)
+        rope_positions = msp_scale_head.build_block_local_positions(scales, batch_size=tokens.shape[0])
+        adarms_cond = jnp.zeros((tokens.shape[0], self.msp_latent_in_proj.out_features), dtype=tokens.dtype)
+        return tokens, input_mask, adarms_cond, rope_positions
+
+    def _compute_msp_loss(
+        self, preprocess_rng: at.KeyArrayLike | None, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        assert self.msp_scales is not None
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        finest_latent = self.msp_action_vae(actions, train=False, method="encode_mean")
+        input_latents, target_latents = msp_scale_head.build_teacher_forced_inputs(finest_latent, self.msp_scales)
+        total_suffix_len = target_latents.shape[1]
+
+        prefix_tokens, prefix_mask, _ = self.embed_prefix(observation)
+        suffix_tokens, suffix_mask, adarms_cond, rope_positions = self._embed_msp_suffix(
+            input_latents,
+            self.msp_scales,
+            pos_start=0,
+            pos_end=total_suffix_len,
+        )
+        suffix_attn_mask = msp_scale_head.build_suffix_block_attention_mask(
+            self.msp_scales, batch_size=suffix_tokens.shape[0], input_mask=suffix_mask
+        )
+        attn_mask = msp_scale_head.build_full_attention_mask(prefix_mask, suffix_mask, suffix_attn_mask)
+        positions = jnp.cumsum(jnp.concatenate([prefix_mask, suffix_mask], axis=1), axis=1) - 1
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+            rope_positions=[None, rope_positions],
+        )
+        diffusion_pos = self._msp_pos_slice(
+            self.msp_diffusion_pos_embed,
+            start=0,
+            end=total_suffix_len,
+            dtype=suffix_out.dtype,
+        )
+        pred_latents = self.msp_latent_out_proj(suffix_out[:, -total_suffix_len:] + diffusion_pos)
+        return jnp.mean(jnp.square(pred_latents - target_latents), axis=-1)
+
+    def _sample_msp_actions(self, observation: _model.Observation) -> _model.Actions:
+        assert self.msp_scales is not None
+        observation = _model.preprocess_observation(None, observation, train=False)
+        batch_size = observation.state.shape[0]
+        latent_dim = self.msp_latent_out_proj.out_features
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions)
+        scale_starts, scale_ends = msp_scale_head.build_scale_segment_bounds(self.msp_scales)
+
+        generated_blocks: list[jnp.ndarray] = []
+        for block_idx in range(len(self.msp_scales)):
+            current_scale = (self.msp_scales[block_idx],)
+            block_start = int(scale_starts[block_idx])
+            block_end = int(scale_ends[block_idx])
+            latent_inputs = msp_scale_head.build_current_scale_inputs(
+                generated_blocks,
+                self.msp_scales,
+                batch_size=batch_size,
+                latent_dim=latent_dim,
+                dtype=prefix_tokens.dtype,
+            )
+            suffix_tokens, suffix_mask, adarms_cond, rope_positions = self._embed_msp_suffix(
+                latent_inputs,
+                current_scale,
+                pos_start=block_start,
+                pos_end=block_end,
+            )
+            previous_suffix_len = sum(self.msp_scales[:block_idx])
+            suffix_attn_mask = jnp.ones((batch_size, current_scale[0], previous_suffix_len + current_scale[0]), dtype=jnp.bool_)
+            prefix_attn_mask = jnp.broadcast_to(prefix_mask[:, None, :], (batch_size, current_scale[0], prefix_mask.shape[1]))
+            attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            start = prefix_mask.shape[1] + previous_suffix_len
+            positions = jnp.broadcast_to(
+                jnp.arange(start, start + current_scale[0], dtype=jnp.int32)[None, :],
+                (batch_size, current_scale[0]),
+            )
+            (_, suffix_out), kv_cache = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+                rope_positions=[None, rope_positions],
+            )
+            diffusion_pos = self._msp_pos_slice(
+                self.msp_diffusion_pos_embed,
+                start=block_start,
+                end=block_end,
+                dtype=suffix_out.dtype,
+            )
+            pred_latents = self.msp_latent_out_proj(suffix_out[:, -current_scale[0] :] + diffusion_pos)
+            generated_blocks.append(pred_latents)
+
+        return self.msp_action_vae(generated_blocks[-1], train=False, method="get_action")
 
     @at.typecheck
     def embed_suffix(
@@ -189,6 +392,9 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        if self.use_msp_action_head:
+            preprocess_rng, _ = jax.random.split(rng)
+            return self._compute_msp_loss(preprocess_rng, observation, actions, train=train)
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -222,6 +428,9 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        if self.use_msp_action_head:
+            del rng, num_steps, noise
+            return self._sample_msp_actions(observation)
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.

@@ -161,16 +161,19 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, rope_positions=None):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
         assert all(config.num_kv_heads == self.configs[0].num_kv_heads for config in self.configs)
 
         dtype = next(x.dtype for x in xs if x is not None)  # original dtype, could be half-precision
+        if rope_positions is None:
+            rope_positions = [None] * len(self.configs)
 
         qkvs = []
-        for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
+        position_start = 0
+        for i, (x, config, expert_rope_positions) in enumerate(zip(xs, self.configs, rope_positions, strict=True)):
             if x is None:
                 continue
             if config.num_kv_heads == config.num_heads:
@@ -196,14 +199,15 @@ class Attention(nn.Module):
                     lora_config=config.lora_configs.get("attn"),
                 )
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
-                qkvs.append((q, k, v))
+            position_end = position_start + x.shape[1]
+            rope_pos = positions[:, position_start:position_end] if expert_rope_positions is None else expert_rope_positions
+            q = _apply_rope(q, positions=rope_pos)
+            q *= self.configs[0].head_dim ** -0.5
+            k = _apply_rope(k, positions=rope_pos)
+            qkvs.append((q, k, v))
+            position_start = position_end
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
-
-        q = _apply_rope(q, positions=positions)
-        q *= self.configs[0].head_dim ** -0.5
-
-        k = _apply_rope(k, positions=positions)
 
         # should still be half-precision here (if input was half-precision)
         assert q.dtype == k.dtype == v.dtype == dtype
@@ -290,7 +294,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, rope_positions, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -305,7 +309,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, rope_positions=rope_positions)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -359,7 +363,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            static_argnums=(6,),  # 0=self, 7=deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -372,7 +376,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=rope_positions, 5=deterministic
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -393,6 +398,7 @@ class Module(nn.Module):
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
         adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        rope_positions: Sequence[at.Int[at.Array, "b _t"] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
@@ -401,8 +407,10 @@ class Module(nn.Module):
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
+        if rope_positions is None:
+            rope_positions = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, rope_positions, deterministic)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
@@ -418,6 +426,7 @@ class Module(nn.Module):
             jnp.zeros((1, len(self.configs)), dtype=jnp.int32),
             jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
             adarms_cond=[jnp.zeros((1, c.width)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)],
+            rope_positions=[None] * len(self.configs),
         )
 
 

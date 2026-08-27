@@ -105,6 +105,8 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # If true, bypass observation loading and only materialize action chunks from the raw LeRobot parquet rows.
+    action_only: bool = False
 
 
 class GroupFactory(Protocol):
@@ -168,6 +170,12 @@ class ModelTransformFactory(GroupFactory):
                             action_horizon=model_config.action_horizon,
                             action_dim=model_config.action_dim,
                         )
+                    ],
+                )
+            case _model.ModelType.MSP_VAE:
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
 
@@ -532,6 +540,22 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class ActionOnlyLeRobotDataConfig(DataConfigFactory):
+    """Action-only LeRobot data config for MSP stage-1 VAE training."""
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=self.action_sequence_keys,
+            action_only=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -550,6 +574,8 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+    # Optional path to a stage-1 MSP VAE params checkpoint. Used only by the pi0.5 MSP stage-2 path.
+    msp_vae_weight_path: str | None = None
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -632,6 +658,93 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    TrainConfig(
+        name="msp_vae_stage1_fake",
+        model=pi0_config.MspActionVAEConfig(action_dim=14, action_horizon=32),
+        data=FakeDataConfig(),
+        batch_size=32,
+        num_workers=0,
+        num_train_steps=16,
+        wandb_enabled=False,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=4,
+            peak_lr=3e-4,
+            decay_steps=16,
+            decay_lr=3e-5,
+        ),
+        optimizer=_optimizer.AdamW(
+            weight_decay=1e-4,
+        ),
+    ),
+    TrainConfig(
+        name="msp_vae_stage1_aloha_action_only_arx-x5",
+        model=pi0_config.MspActionVAEConfig(action_dim=14, action_horizon=32),
+        data=ActionOnlyLeRobotDataConfig(
+            repo_id="RoboDojo_sim_arx-x5_v30",
+            assets=AssetsConfig(
+                assets_dir=str(_ROBODOJO_ASSETS_DIR),
+                asset_id="arx_x5_sim",
+            ),
+            action_sequence_keys=("action",),
+        ),
+        batch_size=512,
+        num_workers=8,
+        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3e-4,
+            decay_steps=60_000,
+            decay_lr=3e-5,
+        ),
+        optimizer=_optimizer.AdamW(
+            weight_decay=1e-4,
+        ),
+    ),
+    TrainConfig(
+        name="pi05_msp_stage2_aloha_arx-x5_seed_0",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            use_msp_action_head=True,
+            action_dim=14,
+            action_horizon=32,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="RoboDojo_sim_arx-x5_v30",
+            assets=AssetsConfig(
+                assets_dir=str(_ROBODOJO_ASSETS_DIR),
+                asset_id="arx_x5_sim",
+            ),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=128,
+        fsdp_devices=2,
+        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+    ),
     TrainConfig(
         name="pi05_base_aloha_full_sim_arx-x5_seed_0",
         model=pi0_config.Pi0Config(pi05=True),

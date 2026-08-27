@@ -162,3 +162,20 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
             result[k] = flat_ref[k]
 
     return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
+def merge_msp_vae_params(params: at.Params, params_path: str, *, source_prefix: str = "action_vae") -> at.Params:
+    """Merge a stage-1 MSP VAE checkpoint into a stage-2 Pi0 MSP action-head model."""
+    loaded_params = _model.restore_params(download.maybe_download(params_path), restore_type=np.ndarray)
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    remapped = {}
+    source_root = f"{source_prefix}/"
+    for key, value in flat_loaded.items():
+        if key.startswith(source_root):
+            remapped[f"msp_action_vae/{key[len(source_root):]}"] = value
+    if not remapped:
+        raise ValueError(
+            f"No parameters found under '{source_prefix}' in MSP VAE checkpoint: {params_path}. "
+            "Expected a stage-1 checkpoint saved from MspActionVAE."
+        )
+    return _merge_params(flax.traverse_util.unflatten_dict(remapped, sep="/"), params, missing_regex=".*")

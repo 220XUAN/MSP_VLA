@@ -39,9 +39,20 @@ bash train.sh <bench_name> <ckpt_name> <env_cfg_type> <action_type> <seed> <gpu_
 
 # Example: train a cotrain run on GPU 0 (comma-separated gpu_id for multi-GPU)
 bash train.sh RoboDojo cotrain arx_x5 joint 0 0
+
+# Example: MSP stage-1 action VAE training on GPU 0
+OPENPI_TRAIN_STAGE=vae_stage1 bash train.sh RoboDojo cotrain arx_x5 joint 0 0
+
+# Example: no-dataset smoke test for MSP stage-1
+OPENPI_TRAIN_STAGE=fake bash train.sh RoboDojo smoke arx_x5 joint 0 0
+
+# Example: MSP stage-2 pi0.5 training with multiscale latent action head
+OPENPI_TRAIN_STAGE=msp_stage2 OPENPI_MSP_VAE_WEIGHT_PATH=/path/to/stage1/params \
+  bash train.sh RoboDojo cotrain arx_x5 joint 0 0
 ```
 
 Checkpoints land in `checkpoints/<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>-<seed>/`; at eval time `ckpt_name` may be the short run name (auto-combined into that directory name), the full run-directory name, or a path to a checkpoint directory. By default training reads the LeRobot repo produced by `process_data.sh` (`<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>`); override with `OPENPI_LEROBOT_REPO_ID` when reusing an existing dataset. `train.sh` sets `fsdp_devices=1` for one visible GPU and `2` for multi-GPU by default (override with `OPENPI_FSDP_DEVICES`).
+For MSP stage 1, `train.sh` selects the `msp_vae_stage1_aloha_action_only_arx-x5` config when `OPENPI_TRAIN_STAGE=vae_stage1`; that config uses an action-only LeRobot loader which reads raw parquet action rows and does not decode images. Without a dataset, use `OPENPI_TRAIN_STAGE=fake` to select `msp_vae_stage1_fake`, which only validates the training/model code path and does not validate real data semantics. For MSP stage 2, `OPENPI_TRAIN_STAGE=msp_stage2` selects `pi05_msp_stage2_aloha_arx-x5_seed_0`; set `OPENPI_MSP_VAE_WEIGHT_PATH=<stage1_params_dir>` so the latent encoder/decoder come from the trained stage-1 VAE.
 
 ## Evaluation
 
@@ -67,6 +78,8 @@ Environment variables used by the adapter scripts:
 | `OPENPI_LEROBOT_REPO_ID` | Overrides the LeRobot repo id used by `train.sh`; defaults to `<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>`. |
 | `OPENPI_FSDP_DEVICES` | Overrides the FSDP device count passed to OpenPI training. |
 | `OPENPI_TRAIN_CONFIG_NAME` | Overrides the training config; defaults to `pi05_base_aloha_full_sim_arx-x5_seed_0`. |
+| `OPENPI_TRAIN_STAGE` | Chooses the default config in `train.sh`; use `vae_stage1` for MSP VAE training, `fake` for no-dataset smoke validation, `msp_stage2` for MSP latent-head pi0.5 training, or `pi05_stage2` for the original pi0.5 training path. |
+| `OPENPI_MSP_VAE_WEIGHT_PATH` | Stage-1 MSP VAE params directory to merge into the Stage-2 pi0.5 MSP model. |
 | `OPENPI_DATA_MODE` | Data-processing mode passed to `openpi/scripts/process_data.py`; defaults to `image`. |
 | `OPENPI_LOCAL_CACHE_ROOT` | Per-host local cache root for the HF datasets / JAX compilation caches; defaults to `/tmp/openpi-cache-$(hostname)`. |
 
