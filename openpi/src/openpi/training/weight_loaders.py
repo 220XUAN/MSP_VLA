@@ -46,12 +46,13 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Regex for missing keys that should be kept from the target model (random init).
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -167,15 +168,44 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
 def merge_msp_vae_params(params: at.Params, params_path: str, *, source_prefix: str = "action_vae") -> at.Params:
     """Merge a stage-1 MSP VAE checkpoint into a stage-2 Pi0 MSP action-head model."""
     loaded_params = _model.restore_params(download.maybe_download(params_path), restore_type=np.ndarray)
+    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
     remapped = {}
     source_root = f"{source_prefix}/"
     for key, value in flat_loaded.items():
         if key.startswith(source_root):
-            remapped[f"msp_action_vae/{key[len(source_root):]}"] = value
+            remapped_key = f"msp_action_vae/{key[len(source_root):]}"
+            remapped[remapped_key] = value
     if not remapped:
         raise ValueError(
             f"No parameters found under '{source_prefix}' in MSP VAE checkpoint: {params_path}. "
             "Expected a stage-1 checkpoint saved from MspActionVAE."
         )
+    matched = []
+    mismatched = []
+    for key, value in remapped.items():
+        if key not in flat_ref:
+            continue
+        ref_shape = getattr(flat_ref[key], "shape", None)
+        loaded_shape = getattr(value, "shape", None)
+        if ref_shape == loaded_shape:
+            matched.append(key)
+        else:
+            mismatched.append((key, loaded_shape, ref_shape))
+    if mismatched:
+        mismatch_str = ", ".join(f"{k}: {src} -> {dst}" for k, src, dst in mismatched[:8])
+        raise ValueError(
+            f"MSP VAE weight merge failed for {params_path}. Found {len(mismatched)} shape mismatches. "
+            f"Examples: {mismatch_str}"
+        )
+    if not matched:
+        raise ValueError(
+            f"MSP VAE weight merge failed for {params_path}. No remapped MSP VAE parameters matched the stage-2 model."
+        )
+    logger.info(
+        "MSP VAE weight merge succeeded from %s: matched %d parameters under '%s'.",
+        params_path,
+        len(matched),
+        source_prefix,
+    )
     return _merge_params(flax.traverse_util.unflatten_dict(remapped, sep="/"), params, missing_regex=".*")

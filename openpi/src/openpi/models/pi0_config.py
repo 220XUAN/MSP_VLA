@@ -37,6 +37,7 @@ class Pi0Config(_model.BaseModelConfig):
     pytorch_compile_mode: str | None = "max-autotune"
     use_msp_action_head: bool = False
     freeze_msp_vae: bool = True
+    msp_action_dim: int | None = None
     msp_encoder_dim: int = 128
     msp_decoder_dim: int = 128
     msp_downsample_factor: int = 4
@@ -64,6 +65,14 @@ class Pi0Config(_model.BaseModelConfig):
         if self.use_msp_action_head:
             if not self.pi05:
                 raise ValueError("MSP action head currently supports only pi0.5 (set pi05=True)")
+            if self.msp_action_dim is None:
+                object.__setattr__(self, "msp_action_dim", self.action_dim)
+            assert self.msp_action_dim is not None
+            if self.msp_action_dim > self.action_dim:
+                raise ValueError(
+                    f"msp_action_dim must be <= action_dim for padding compatibility, got "
+                    f"{self.msp_action_dim} > {self.action_dim}"
+                )
             latent_horizon = self.msp_latent_horizon
             if latent_horizon is None:
                 latent_horizon = msp_scale_head.latent_horizon_from_action_horizon(
@@ -152,8 +161,9 @@ class Pi0Config(_model.BaseModelConfig):
         return nnx.All(*filters)
 
     def make_msp_vae_config(self) -> "MspActionVAEConfig":
+        assert self.msp_action_dim is not None
         return MspActionVAEConfig(
-            action_dim=self.action_dim,
+            action_dim=self.msp_action_dim,
             action_horizon=self.action_horizon,
             encoder_dim=self.msp_encoder_dim,
             decoder_dim=self.msp_decoder_dim,

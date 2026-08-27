@@ -28,6 +28,8 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
+logger = logging.getLogger(__name__)
+
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -120,9 +122,13 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
+    logger.info("Loading base model weights with loader: %s", type(config.weight_loader).__name__)
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    logger.info("Base model weight load succeeded.")
     if config.msp_vae_weight_path is not None:
+        logger.info("Loading MSP stage-1 weights from %s", config.msp_vae_weight_path)
         partial_params = _weight_loaders.merge_msp_vae_params(partial_params, config.msp_vae_weight_path)
+        logger.info("MSP stage-1 weight load succeeded.")
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.

@@ -368,6 +368,21 @@ class PadStatesAndActions(DataTransformFn):
         return data
 
 
+@dataclasses.dataclass(frozen=True)
+class PadToDims(DataTransformFn):
+    """Zero-pads state and actions independently."""
+
+    state_dim: int | None = None
+    action_dim: int | None = None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "state" in data and self.state_dim is not None:
+            data["state"] = pad_to_dim(data["state"], self.state_dim, axis=-1)
+        if "actions" in data and self.action_dim is not None:
+            data["actions"] = pad_to_dim(data["actions"], self.action_dim, axis=-1)
+        return data
+
+
 def flatten_dict(tree: at.PyTree) -> dict:
     """Flatten a nested dictionary. Uses '/' as the separator."""
     return traverse_util.flatten_dict(tree, sep="/")

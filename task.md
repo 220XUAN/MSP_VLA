@@ -725,6 +725,80 @@ Stage-2 训练命令：
 - `openpi/src/openpi/models/pi0.py`
 - `task.md`
 
+## 2026-08-27 Stage-2 loss 对齐：接入原版 MSP 的尺度加权机制
+
+你指出的这一点是对的。原版 MSP 在 `MSP/algos/flow/flow_ar.py` 里不是把所有尺度 token loss 直接平均，而是：
+
+```python
+max_scale = self.scale[-1]
+loss = []
+start = 0
+for i in self.scale:
+    l, l_dict = self.flownet(gt_latents[:, start:start + i], z[:, start:start + i, ...])
+    start += i
+    loss.append(l * i / max_scale)
+flow_loss = sum(loss)
+```
+
+也就是：
+- 先按尺度分段求每个 block 的 loss
+- 再乘 `scale / max_scale`
+- 最后把所有尺度加起来
+
+本轮修改：
+1. Stage-2 的训练总 loss 改成按尺度加权汇总
+- 文件：`openpi/src/openpi/models/pi0.py`
+- 在 `_compute_msp_loss_with_info(...)` 里：
+  - 先得到每个尺度段的 `block_loss`
+  - 再做：
+    - `weighted_block_loss = block_loss * (scale / max_scale)`
+  - 最后：
+    - `weighted_total = sum(weighted_block_loss over scales)`
+- 返回给训练主循环的 loss 改为：
+  - `weighted_total[:, None]`
+
+2. 保留 raw per-scale 监控，同时补 weighted 指标
+- 文件：`openpi/src/openpi/models/pi0.py`
+- 现在会同时输出：
+  - `msp_loss_scale_<scale>`：该尺度原始平均 loss
+  - `msp_loss_scale_<scale>_weighted`：该尺度乘权重后的 loss
+
+3. 总指标语义更新
+- `msp_loss_total`
+  - 现在表示 **按原版 MSP 权重聚合后的总 loss**
+- `msp_loss_finest`
+  - 仍表示最细尺度的 raw loss
+- `msp_loss_finest_weighted`
+  - 表示最细尺度乘权重后的 loss
+
+当前效果：
+- Stage-2 的反向传播目标现在和原版 MSP 的尺度加权思路一致
+- 粗尺度的贡献会按 `scale / max_scale` 参与总 loss
+- 同时你在 TensorBoard / wandb 里还能区分：
+  - 原始每尺度 loss
+  - 加权后的每尺度 loss
+
+当前会看到的 Stage-2 指标：
+- `msp_loss_total`
+- `msp_loss_finest`
+- `msp_loss_finest_weighted`
+- `msp_loss_scale_1`
+- `msp_loss_scale_1_weighted`
+- `msp_loss_scale_2`
+- `msp_loss_scale_2_weighted`
+- `msp_loss_scale_4`
+- `msp_loss_scale_4_weighted`
+- `msp_loss_scale_8`
+- `msp_loss_scale_8_weighted`
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/pi0.py`
+- `git diff --check -- openpi/src/openpi/models/pi0.py`
+
+本轮修改文件：
+- `openpi/src/openpi/models/pi0.py`
+- `task.md`
+
 ### 1. 新增三组 MSP learned positional embeddings
 
 在 `Pi0.__init__()` 的 MSP 分支里新增了三个参数：
@@ -948,6 +1022,26 @@ Stage-2 训练命令：
 - `openpi/.venv/bin/python -m py_compile openpi/src/openpi/training/data_loader.py`
 - `git diff --check -- openpi/src/openpi/training/data_loader.py task.md`
 
+## 2026-08-27 新理解：Stage1 14D / Stage2 32D 的“能训练”不等于维度契约正确
+
+核对结果：
+- `pi05_base_aloha_full_sim_arx-x5_seed_0` 的 `model=Pi0Config(pi05=True)`，默认 `action_dim=32`
+- 训练时数据侧会经过 `PadStatesAndActions(model_config.action_dim)`
+- 所以原始 14 维动作会被 pad 到 32 维，再送进 pi0.5
+
+结论：
+- “不显式传 `action_dim=14` 也能训练”是因为 **pi0.5 一直按 32 维建模，数据被 pad 到 32 维**
+- 这不代表模型自动推断了 14 维
+
+对 MSP 的影响：
+- 如果 Stage2 也用 `action_dim=32`，那 pi0.5 base checkpoint 的动作相关层 shape 是兼容的
+- 但如果 Stage1 VAE 是按 14 维训练出来的，而 Stage2 的 `msp_action_vae` 是按 32 维实例化的，那么两阶段的 VAE 输入输出 action 维度其实不一致
+
+判断：
+- 这种情况下“能启动训练”并不自动说明是合理的
+- 更可能只是当前某条加载/校验路径没有把这个 mismatch 在初始化时拦下来
+- 从模型语义上看，Stage1 和 Stage2 的 `msp_action_vae` action space 最好保持一致
+
 ## 2026-08-27 README 补充：第二阶段训练启动方式
 
 需求：
@@ -982,6 +1076,96 @@ Stage-2 训练命令：
 - 包括新建的 `openpi/scripts/train_tb.py`
 - 不包含未跟踪的 `MSP/` 参考目录
 
+本次同步结果：
+- 上层仓库本地提交：
+  - `fa0c909 Update Pi_05 training and logging`
+- 由于远端 `msp_vla/main` 是 `Pi_05 subtree` 历史，普通 push 被拒绝为 non-fast-forward
+- 已重新生成 subtree 分支：
+  - `pi05_sync_20260827`
+  - split head: `d87fff8`
+- 已同步到 GitHub：
+  - `msp_vla/main -> d87fff8`
+
+## 2026-08-27 本轮优化：`train_multi_H20.sh` 增加 stage 开关
+
+需求：
+- 新增的 `train_multi_H20.sh` 用于服务器训练
+- 需要增加一个开关判断 Stage 1 / Stage 2
+- Stage 1 不需要加载 pi0.5 基础权重，也不需要加载 MSP VAE 权重
+- 两个阶段的学习率和 decay 策略不同
+
+本轮修改文件：
+- `train_multi_H20.sh`
+- `task.md`
+
+实现内容：
+
+1. 新增阶段选择：
+- 使用环境变量：
+  - `OPENPI_TRAIN_STAGE`
+- 支持：
+  - `stage1`
+  - `stage2`
+- 如果没有显式设置，就根据 `train_config_name` 自动推断
+
+2. Stage 1 默认超参：
+- `decay_steps=num_train_steps`
+- `peak_lr=3e-4`
+- `decay_lr=3e-5`
+- `load_base_weights=false`
+- `load_msp_vae_weights=false`
+
+3. Stage 2 默认超参：
+- `decay_steps=num_train_steps / 2`
+- `peak_lr=5e-5`
+- `decay_lr=1e-5`
+- `load_base_weights=true`
+- `load_msp_vae_weights=true`
+
+4. 权重加载行为：
+- Stage 1：
+  - 不再传 `--weight-loader.params-path`
+  - 不再传 `--msp-vae-weight-path`
+  - 不再检查 `PARAMS_PATH`
+- Stage 2：
+  - 继续传 `--weight-loader.params-path="${PARAMS_PATH}"`
+  - 如果给了 `MSP_VAE_WEIGHT_PATH`，再传 `--msp-vae-weight-path="${MSP_VAE_WEIGHT_PATH}"`
+
+5. 日志和路径校验：
+- 启动时打印 `TRAIN_STAGE`
+- 打印当前生效的：
+  - `decay_steps`
+  - `peak_lr`
+  - `decay_lr`
+- Stage 1 会明确打印：
+  - `PARAMS_PATH: skipped for stage1`
+  - `MSP_VAE_WEIGHT_PATH: skipped for stage1`
+
+6. 示例命令更新：
+- Stage 1 示例改成显式：
+  - `OPENPI_TRAIN_STAGE=stage1 ...`
+- Stage 2 示例改成显式：
+  - `OPENPI_TRAIN_STAGE=stage2 ...`
+
+7. Stage 2 的 MSP VAE 默认路径：
+- 脚本现在直接使用固定默认值：
+  - `MSP_VAE_WEIGHT_PATH="${MSP_VAE_WEIGHT_PATH:-/mnt/vepfs/vbot/lzx/RoboDojo/XPolicyLab/policy/Pi_05/checkpoints/stack_bowls_stage_1-0/29999/params}"`
+- 也就是说 Stage 2 不显式传时，会默认读取：
+  - `/mnt/vepfs/vbot/lzx/RoboDojo/XPolicyLab/policy/Pi_05/checkpoints/stack_bowls_stage_1-0/29999/params`
+- 如果默认路径不对，直接覆盖：
+  - `MSP_VAE_WEIGHT_PATH=/your/stage1/params`
+
+8. 启动示例位置：
+- 已把 `train_multi_H20.sh` 的 Stage1 / Stage2 启动示例整理到脚本最底部
+- 现在脚本尾部保留三种用法：
+  - Stage1 预训练
+  - Stage2 使用默认 `MSP_VAE_WEIGHT_PATH`
+  - Stage2 手动覆盖 `MSP_VAE_WEIGHT_PATH`
+
+本轮验证：
+- `bash -n train_multi_H20.sh`
+- `git diff --check -- train_multi_H20.sh task.md`
+
 ## 2026-08-27 Git 操作记录
 
 当前用户要求：
@@ -1012,3 +1196,386 @@ Stage-2 训练命令：
 - 已强制更新远端：
   - `pi05_only -> msp_vla/main`
 - 现在 `220XUAN/MSP_VLA.git` 的 `main` 应该只包含 `Pi_05` 目录内容，不再包含整个上层 `XPolicyLab`
+
+## 2026-08-27 Stage-2 权重加载修正
+
+当前问题：
+- Stage-2 模型在 pi0.5 基础上新增了 `msp_*` 参数。
+- 直接加载原始 pi0.5 checkpoint 时，这些新增参数在源 checkpoint 中不存在，会触发结构不匹配。
+- 同时需要在加载 Stage-1 VAE 权重后，明确输出成功/失败状态，方便服务器日志排查。
+
+本轮修改：
+1. `CheckpointWeightLoader` 支持可配置的 `missing_regex`
+- 文件：`openpi/src/openpi/training/weight_loaders.py`
+- 默认仍是：
+  - `".*lora.*"`
+- 现在可以在特定 config 里改成：
+  - `".*lora.*|.*msp.*"`
+- 这样加载原始 pi0.5 权重时，会自动跳过所有 `msp_*` 新增参数，并保留目标模型里的随机初始化值。
+
+2. Stage-2 config 显式跳过 MSP 新增头
+- 文件：`openpi/src/openpi/training/config.py`
+- `pi05_msp_stage2_aloha_arx-x5_seed_0` 现在使用：
+  - `CheckpointWeightLoader(..., missing_regex=".*lora.*|.*msp.*")`
+- 含义：
+  - 原始 pi0.5 checkpoint 只加载公共参数
+  - 所有 MSP 相关新增参数不从 pi0.5 checkpoint 读取，改为随机初始化
+
+3. Stage-1 VAE 权重合并增加校验和日志
+- 文件：`openpi/src/openpi/training/weight_loaders.py`
+- `merge_msp_vae_params()` 现在会：
+  - 检查 checkpoint 中是否存在 `action_vae/...` 参数
+  - 重映射到 Stage-2 模型中的 `msp_action_vae/...`
+  - 校验 shape 是否一致
+  - 如果没有匹配项或 shape 不一致，直接报错
+  - 如果成功，输出成功日志，包含匹配到的参数数量
+
+4. 训练入口增加显式状态日志
+- 文件：
+  - `openpi/scripts/train.py`
+  - `openpi/scripts/train_tb.py`
+- 现在初始化时会明确打印：
+  - 开始加载 base model weights
+  - base model weight load succeeded
+  - 开始加载 MSP stage-1 weights
+  - MSP stage-1 weight load succeeded
+
+当前效果：
+- 加载原始 pi0.5 checkpoint 时，不再因为 `msp_*` 新增参数缺失而报结构错
+- Stage-1 VAE checkpoint 如果真正合并成功，日志里会有明确成功信息
+- 如果 Stage-1 checkpoint 路径对了但内部结构/shape 不对，会直接报清楚，而不是静默失败
+
+本轮修改文件：
+- `openpi/src/openpi/training/weight_loaders.py`
+- `openpi/src/openpi/training/config.py`
+- `openpi/scripts/train.py`
+- `openpi/scripts/train_tb.py`
+- `task.md`
+
+## 2026-08-27 维度解耦：Stage-2 保留 pi0.5 的 32 维接口，同时让 MSP VAE 只建模真实 14 维动作
+
+新的设计决定：
+- `Pi0Config.action_dim` 继续保留给 pi0.5 主干，用于兼容原始 base checkpoint
+- 新增 `Pi0Config.msp_action_dim`
+- Stage-2 的 MSP 分支不再默认复用 `action_dim`
+- 对 Aloha 场景：
+  - `action_dim=32`
+  - `msp_action_dim=14`
+
+原因：
+- 原始 pi0.5 base checkpoint 的动作相关投影层是按 32 维训练的
+- 但 MSP 的 Stage-1 / Stage-2 VAE 契约应该跟真实动作空间一致，即 14 维
+- 所以需要把“pi0.5 兼容维度”和“MSP VAE 真实动作维度”拆开，不能继续混用
+
+本轮实现：
+1. `Pi0Config` 新增 `msp_action_dim`
+- 文件：`openpi/src/openpi/models/pi0_config.py`
+- `use_msp_action_head=True` 时：
+  - 如果没传 `msp_action_dim`，默认回退到 `action_dim`
+  - 增加校验：`msp_action_dim <= action_dim`
+- `make_msp_vae_config()` 改为用 `msp_action_dim` 构造 Stage-2 里的 `msp_action_vae`
+
+2. 数据 transforms 拆分 state/action padding
+- 文件：
+  - `openpi/src/openpi/transforms.py`
+  - `openpi/src/openpi/training/config.py`
+- 新增 `PadToDims(state_dim=..., action_dim=...)`
+- 对 `Pi0Config(use_msp_action_head=True)`：
+  - `state` 继续 pad 到 `action_dim=32`
+  - `actions` 只 pad 到 `msp_action_dim=14`
+- 这样 Stage-2 训练时送进 MSP VAE 的动作就是 14 维，不再被 pad 到 32
+
+3. Stage-2 模型内部改为“MSP 用 14 维，外部接口仍保留 32 维”
+- 文件：`openpi/src/openpi/models/pi0.py`
+- `msp_action_vae.lazy_init(...)` 改成按 `msp_action_dim`
+- `compute_msp_loss()` 里先裁剪：
+  - `actions[..., :msp_action_dim]`
+  - 再送入 `msp_action_vae.encode_mean(...)`
+- 推理时：
+  - `msp_action_vae.decode(...)` 先得到 14 维动作
+  - 再 pad 回 `action_dim=32`
+
+这一步的含义：
+- MSP latent 建模只看真实动作维度
+- 外部 `BaseModel.action_dim`、已有测试假设、以及部分下游接口仍能维持 32 维不变
+- Aloha 输出端本来就只取前 14 维，所以推理链路仍兼容
+
+4. Stage-2 config 显式使用 `msp_action_dim=14`
+- 文件：`openpi/src/openpi/training/config.py`
+- `pi05_msp_stage2_aloha_arx-x5_seed_0` 现在不再改 `action_dim`
+- 改为：
+  - `action_dim` 维持 pi0.5 默认值 32
+  - `msp_action_dim=14`
+
+当前效果：
+- Stage-1 的 14D MSP VAE 与 Stage-2 的 `msp_action_vae` 维度契约终于一致
+- 原始 pi0.5 checkpoint 仍可按 32D 主干结构加载
+- Stage-2 的 MSP latent 监督不再吃 32D padded action，而是吃真实 14D action
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/transforms.py openpi/src/openpi/models/pi0_config.py openpi/src/openpi/models/pi0.py openpi/src/openpi/training/config.py`
+- `git diff --check -- openpi/src/openpi/transforms.py openpi/src/openpi/models/pi0_config.py openpi/src/openpi/models/pi0.py openpi/src/openpi/training/config.py`
+
+本轮修改文件：
+- `openpi/src/openpi/transforms.py`
+- `openpi/src/openpi/models/pi0_config.py`
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/training/config.py`
+- `task.md`
+
+## 2026-08-27 Stage-2 mask 对齐：先把 block-wise scale mask 收紧到 MSP 原版语义
+
+这一步只处理第一优先级问题：attention mask。
+
+原版 MSP 的关键语义：
+- 同一尺度内 token 彼此全可见
+- 当前尺度可以看到所有更粗尺度
+- 当前尺度不能看到任何更细尺度
+- 这不是 token-level causal mask，而是 block-wise scale mask
+
+本轮修改：
+1. 统一出显式的 MSP block-wise 可见性矩阵
+- 文件：`openpi/src/openpi/models/msp_scale_head.py`
+- 新增：
+  - `build_blockwise_visibility(scales)`
+- 该函数直接生成和 MSP 原版一致的 suffix 可见性矩阵
+
+2. 训练阶段 suffix mask 改成复用这套显式矩阵
+- 文件：`openpi/src/openpi/models/msp_scale_head.py`
+- `build_suffix_block_attention_mask(...)` 现在不再现场拼接逻辑，而是直接基于：
+  - `build_blockwise_visibility(scales)`
+- 这样训练期 mask 语义被固定下来，更容易核对和回归
+
+3. 推理阶段当前尺度的 mask 也改成从同一套矩阵切片
+- 文件：
+  - `openpi/src/openpi/models/msp_scale_head.py`
+  - `openpi/src/openpi/models/pi0.py`
+- 新增：
+  - `build_current_block_attention_mask(scales, block_index, ...)`
+- 推理时当前尺度 block 的 mask 不再手写 `all-ones`，而是直接取：
+  - 全量训练 mask 中当前 block 对应的行
+- 这样训练和推理使用的是同一套 block-wise 语义
+
+4. 保留 `build_scale_ar_mask(...)`，但文档改清楚
+- 文件：`openpi/src/openpi/models/msp_scale_head.py`
+- 它现在被明确标注为：
+  - big_vision 风格 block-wise AR 边界辅助
+- 不是普通 token-level causal mask
+
+5. 新增 mask 回归测试
+- 文件：`openpi/src/openpi/models/msp_scale_head_test.py`
+- 测了两件事：
+  - `(1, 2, 4, 8)` 是否生成与 MSP 原版一致的 15x15 block-wise 可见性矩阵
+  - 推理阶段 `build_current_block_attention_mask(...)` 是否严格等于训练期全量 mask 对应 block 的行切片
+
+当前结果：
+- Stage-2 的训练 suffix mask 和推理 suffix mask 现在都收敛到了同一套 MSP block-wise 语义
+- 这一步没有动位置编码、RoPE 或损失，只收紧 mask
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/msp_scale_head.py openpi/src/openpi/models/pi0.py openpi/src/openpi/models/msp_scale_head_test.py`
+- `git diff --check -- openpi/src/openpi/models/msp_scale_head.py openpi/src/openpi/models/pi0.py openpi/src/openpi/models/msp_scale_head_test.py`
+- 单测未执行：
+  - `openpi/.venv/bin/python -m pytest openpi/src/openpi/models/msp_scale_head_test.py`
+  - 失败原因：当前 `.venv` 里没有安装 `pytest`
+
+本轮修改文件：
+- `openpi/src/openpi/models/msp_scale_head.py`
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/msp_scale_head_test.py`
+- `task.md`
+
+## 2026-08-27 结论收口：Gemma action head 的 block-local RoPE 已经具备，不需要再重写 attention
+
+这一步先核实了 `Gemma` 是否真的还缺 block-local RoPE。
+
+核对结果：
+- `openpi/src/openpi/models/gemma.py` 里的 `Attention.__call__(...)` 已经支持：
+  - 默认使用全局 `positions`
+  - 但如果传了 `rope_positions`，就优先用 `rope_positions`
+- 当前 MSP Stage-2 路径在 `pi0.py` 里对 suffix 已经传入：
+  - `rope_positions=[None, rope_positions]`
+- 也就是说：
+  - prefix / VLM 仍走原始全局 RoPE
+  - suffix / MSP action head 已经可以走自定义 RoPE 位置
+
+而当前 suffix 提供的 `rope_positions` 是：
+- `build_block_local_positions(scales, batch_size=...)`
+- 它的语义正是：
+  - 每个尺度 block 内部位置从 `0` 重新开始
+  - 例如 `(1,2,4,8)` 会得到：
+    - `[0 | 0,1 | 0,1,2,3 | 0,1,2,3,4,5,6,7]`
+
+所以结论是：
+- 从机制上说，当前实现已经具备你要求的 “新增一个 block-local RoPE”
+- 而且不需要改 VLM 部分，也不需要重写 Gemma attention
+- 关键只在于：
+  - suffix 要稳定传入 block-local `rope_positions`
+  - 训练和推理都要保持这个约定
+
+本轮做的事情：
+1. 在 `pi0.py` 里补明确注释
+- 文件：`openpi/src/openpi/models/pi0.py`
+- 明确写清：
+  - 全局 `positions` 继续服务于 sequence / KV cache 排布
+  - `rope_positions` 单独覆盖为 per-scale local positions
+
+2. 新增 block-local RoPE 回归测试
+- 文件：`openpi/src/openpi/models/msp_scale_head_test.py`
+- 新增测试：
+  - `build_block_local_positions_resets_inside_each_scale_block()`
+- 锁定 `(1,2,4,8)` 时的位置为：
+  - `[0, 0,1, 0,1,2,3, 0,1,2,3,4,5,6,7]`
+
+当前结果：
+- 这一步没有再去改 `Gemma` 模块结构
+- 结论是：现有 `rope_positions` 覆盖路径已经足够实现 MSP 所需的 block-local RoPE
+- 现在 Stage-2 在 mask、三组 learned positional embeddings、以及 block-local RoPE 这三块都已经有了明确实现路径
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/pi0.py openpi/src/openpi/models/msp_scale_head_test.py`
+- `git diff --check -- openpi/src/openpi/models/pi0.py openpi/src/openpi/models/msp_scale_head_test.py`
+
+本轮修改文件：
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/msp_scale_head_test.py`
+- `task.md`
+
+## 2026-08-27 Stage-2 指标补充：输出 per-scale loss 到 TensorBoard / wandb
+
+这一步的目标不是改训练目标，而是把 MSP Stage-2 的 coarse-to-fine 学习状态直接暴露出来。
+
+现状：
+- `train.py` 和 `train_tb.py` 本来就支持记录 `model.compute_loss_with_info(...)` 返回的 `metric_info`
+- 之前 Stage-2 的 `Pi0(use_msp_action_head=True)` 只返回总的 latent token loss，没有把各尺度拆出来
+
+本轮修改：
+1. `Pi0` 新增 MSP 专用的带指标损失路径
+- 文件：`openpi/src/openpi/models/pi0.py`
+- 新增：
+  - `_compute_msp_loss_with_info(...)`
+- 逻辑：
+  - 先保持原有 Stage-2 latent MSE 不变
+  - 再把 `token_loss` 按 `msp_scales` 切成多个 block
+  - 对每个 block 求均值，作为单独指标输出
+
+2. `compute_loss()` 保持原训练目标不变
+- 文件：`openpi/src/openpi/models/pi0.py`
+- `use_msp_action_head=True` 时：
+  - `compute_loss()` 只是调用 `_compute_msp_loss_with_info(...)[0]`
+- 所以反向传播使用的仍然是原来的：
+  - multi-scale latent prediction MSE
+
+3. `compute_loss_with_info()` 接入 Stage-2 指标
+- 文件：`openpi/src/openpi/models/pi0.py`
+- `use_msp_action_head=True` 时，返回：
+  - `token_loss`
+  - `metric_info`
+
+新增指标：
+- `msp_loss_total`
+  - 所有尺度 token loss 的整体均值
+- `msp_loss_finest`
+  - 最细尺度 block 的均值
+- `msp_loss_scale_<scale>`
+  - 每个尺度 block 的均值
+  - 例如 `(1,2,4,8)` 时会有：
+    - `msp_loss_scale_1`
+    - `msp_loss_scale_2`
+    - `msp_loss_scale_4`
+    - `msp_loss_scale_8`
+
+这意味着现在训练时你能直接观察：
+- 最粗尺度是否先收敛
+- 中间尺度是否跟上
+- 最细尺度是否迟迟不降
+
+日志链路说明：
+- `train_tb.py` 已经会把 `metric_info` 里的每一项写入 TensorBoard
+- `train.py` 也会把同样的指标写入 wandb
+- 所以这一步不需要改训练脚本，只改模型输出即可
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/pi0.py`
+- `git diff --check -- openpi/src/openpi/models/pi0.py`
+
+本轮修改文件：
+- `openpi/src/openpi/models/pi0.py`
+- `task.md`
+
+## 2026-08-27 Stage-2 位置编码语义收紧：训练全长，推理按尺度段切片
+
+这一步处理的是你前面反复强调的那组 MSP 细节：
+- `encoder_pos_embed_learned`
+- `decoder_pos_embed_learned`
+- `diffusion_pos_embed_learned`
+- 以及推理时的 `start:end` 切片语义
+
+核对结果：
+- 这三组 learned positional embeddings 之前其实已经接进 `pi0.py`
+- 但训练路径是通过 `0:total_len` 取全长，功能上没问题，语义上不够明确
+- 推理路径虽然也在切 `block_start:block_end`，但没有被抽象成统一规则，后续容易被改乱
+
+本轮修改：
+1. 统一出“训练全表 / 推理切当前 block” 的位置切片 helper
+- 文件：`openpi/src/openpi/models/msp_scale_head.py`
+- 新增：
+  - `slice_scale_positions(pos_embed, scales, block_index)`
+- 规则：
+  - `block_index=None` -> 返回整张位置表，对应训练
+  - `block_index=i` -> 返回第 `i` 个尺度 block 的位置切片，对应推理
+
+2. `pi0.py` 改成显式按 `block_index` 取三组 learned pos embed
+- 文件：`openpi/src/openpi/models/pi0.py`
+- `_msp_pos_slice(...)` 不再接 `start/end`
+- 改为通过：
+  - `block_index=None` 表示训练全长
+  - `block_index=block_idx` 表示推理当前尺度段
+
+3. 训练路径语义改清楚
+- 文件：`openpi/src/openpi/models/pi0.py`
+- `_compute_msp_loss()` 中：
+  - `encoder_pos_embed`
+  - `decoder_pos_embed`
+  - `diffusion_pos_embed`
+  都显式走 `block_index=None`
+- 这对应 MSP 原版里的 `training=True` 使用整张 learned position table
+
+4. 推理路径语义改清楚
+- 文件：`openpi/src/openpi/models/pi0.py`
+- `_sample_msp_actions()` 中每个尺度 block：
+  - `encoder_pos_embed`
+  - `decoder_pos_embed`
+  - `diffusion_pos_embed`
+  都显式走 `block_index=block_idx`
+- 这对应 MSP 原版里的：
+  - `[:, start:end]`
+
+5. 增加 shape 断言
+- 文件：`openpi/src/openpi/models/pi0.py`
+- 训练时断言：
+  - `diffusion_pos.shape[1] == total_suffix_len`
+- 推理时断言：
+  - `diffusion_pos.shape[1] == current_scale_len`
+- 这样位置切片一旦和 block 长度不一致，会立即暴露
+
+6. 新增位置切片回归测试
+- 文件：`openpi/src/openpi/models/msp_scale_head_test.py`
+- 新增测试覆盖：
+  - `block_index=None` 时返回完整位置表
+  - `block_index=i` 时返回全表的对应 `start:end` 切片
+
+当前结果：
+- 这一步没有改变 Stage-2 的总体结构
+- 但把 MSP 原版“训练全长 / 推理分段切片”的位置编码语义固定下来了
+- 后面做 block-local RoPE 时，可以直接在这套分段语义上继续，不需要再返工这三组 learned pos embed
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/msp_scale_head.py openpi/src/openpi/models/pi0.py openpi/src/openpi/models/msp_scale_head_test.py`
+- `git diff --check -- openpi/src/openpi/models/msp_scale_head.py openpi/src/openpi/models/pi0.py openpi/src/openpi/models/msp_scale_head_test.py`
+
+本轮修改文件：
+- `openpi/src/openpi/models/msp_scale_head.py`
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/msp_scale_head_test.py`
+- `task.md`

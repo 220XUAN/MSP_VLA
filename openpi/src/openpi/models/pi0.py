@@ -88,6 +88,7 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.use_msp_action_head = config.use_msp_action_head
         self.msp_scales = config.msp_scales
+        self.msp_action_dim = config.msp_action_dim if config.msp_action_dim is not None else config.action_dim
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -141,7 +142,7 @@ class Pi0(_model.BaseModel):
                 )
             )
             self.msp_action_vae.lazy_init(
-                jnp.ones((1, config.action_horizon, config.action_dim), dtype=jnp.float32),
+                jnp.ones((1, config.action_horizon, self.msp_action_dim), dtype=jnp.float32),
                 jax.random.key(0),
                 train=False,
                 rngs=rngs,
@@ -198,17 +199,9 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
-    def _msp_pos_slice(
-        self,
-        pos_embed: nnx.Param,
-        *,
-        start: int | None = None,
-        end: int | None = None,
-        dtype: jnp.dtype,
-    ) -> jnp.ndarray:
-        pos = pos_embed.value
-        if start is not None or end is not None:
-            pos = pos[:, start:end, :]
+    def _msp_pos_slice(self, pos_embed: nnx.Param, *, block_index: int | None, dtype: jnp.dtype) -> jnp.ndarray:
+        assert self.msp_scales is not None
+        pos = msp_scale_head.slice_scale_positions(pos_embed.value, self.msp_scales, block_index)
         return pos.astype(dtype)
 
     def _embed_msp_suffix(
@@ -216,8 +209,7 @@ class Pi0(_model.BaseModel):
         latent_inputs: jnp.ndarray,
         scales: tuple[int, ...],
         *,
-        pos_start: int | None = None,
-        pos_end: int | None = None,
+        block_index: int | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -229,28 +221,43 @@ class Pi0(_model.BaseModel):
         scale_emb = self.msp_scale_embed(scale_ids)[None, :, :]
         encoder_pos = self._msp_pos_slice(
             self.msp_encoder_pos_embed,
-            start=pos_start,
-            end=pos_end,
+            block_index=block_index,
             dtype=action_tokens.dtype,
         )
         decoder_pos = self._msp_pos_slice(
             self.msp_decoder_pos_embed,
-            start=pos_start,
-            end=pos_end,
+            block_index=block_index,
             dtype=action_tokens.dtype,
         )
         tokens = action_tokens + scale_emb + encoder_pos + decoder_pos
         input_mask = jnp.ones(tokens.shape[:2], dtype=jnp.bool_)
+        # Keep global `positions` for sequence/cache layout, but override RoPE with
+        # per-scale local positions so each MSP block resets to 0..scale_len-1.
         rope_positions = msp_scale_head.build_block_local_positions(scales, batch_size=tokens.shape[0])
         adarms_cond = jnp.zeros((tokens.shape[0], self.msp_latent_in_proj.out_features), dtype=tokens.dtype)
         return tokens, input_mask, adarms_cond, rope_positions
 
+    def _select_msp_actions(self, actions: jnp.ndarray) -> jnp.ndarray:
+        return actions[..., : self.msp_action_dim]
+
+    def _pad_msp_actions(self, actions: jnp.ndarray) -> jnp.ndarray:
+        if actions.shape[-1] == self.action_dim:
+            return actions
+        pad_width = ((0, 0),) * (actions.ndim - 1) + ((0, self.action_dim - actions.shape[-1]),)
+        return jnp.pad(actions, pad_width)
+
     def _compute_msp_loss(
         self, preprocess_rng: at.KeyArrayLike | None, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        loss, _ = self._compute_msp_loss_with_info(preprocess_rng, observation, actions, train=train)
+        return loss
+
+    def _compute_msp_loss_with_info(
+        self, preprocess_rng: at.KeyArrayLike | None, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         assert self.msp_scales is not None
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        finest_latent = self.msp_action_vae(actions, train=False, method="encode_mean")
+        finest_latent = self.msp_action_vae(self._select_msp_actions(actions), train=False, method="encode_mean")
         input_latents, target_latents = msp_scale_head.build_teacher_forced_inputs(finest_latent, self.msp_scales)
         total_suffix_len = target_latents.shape[1]
 
@@ -258,8 +265,7 @@ class Pi0(_model.BaseModel):
         suffix_tokens, suffix_mask, adarms_cond, rope_positions = self._embed_msp_suffix(
             input_latents,
             self.msp_scales,
-            pos_start=0,
-            pos_end=total_suffix_len,
+            block_index=None,
         )
         suffix_attn_mask = msp_scale_head.build_suffix_block_attention_mask(
             self.msp_scales, batch_size=suffix_tokens.shape[0], input_mask=suffix_mask
@@ -275,12 +281,35 @@ class Pi0(_model.BaseModel):
         )
         diffusion_pos = self._msp_pos_slice(
             self.msp_diffusion_pos_embed,
-            start=0,
-            end=total_suffix_len,
+            block_index=None,
             dtype=suffix_out.dtype,
         )
+        assert diffusion_pos.shape[1] == total_suffix_len
         pred_latents = self.msp_latent_out_proj(suffix_out[:, -total_suffix_len:] + diffusion_pos)
-        return jnp.mean(jnp.square(pred_latents - target_latents), axis=-1)
+        token_loss = jnp.mean(jnp.square(pred_latents - target_latents), axis=-1)
+
+        scale_starts, scale_ends = msp_scale_head.build_scale_segment_bounds(self.msp_scales)
+        max_scale = float(self.msp_scales[-1])
+        weighted_block_losses = []
+        metric_info = {}
+        for block_idx, scale in enumerate(self.msp_scales):
+            start = int(scale_starts[block_idx])
+            end = int(scale_ends[block_idx])
+            block_loss = jnp.mean(token_loss[:, start:end], axis=-1)
+            weighted_block_loss = block_loss * (scale / max_scale)
+            weighted_block_losses.append(weighted_block_loss)
+            metric_info[f"msp_loss_scale_{scale}"] = jnp.mean(block_loss)
+            metric_info[f"msp_loss_scale_{scale}_weighted"] = jnp.mean(weighted_block_loss)
+
+        weighted_total = jnp.sum(jnp.stack(weighted_block_losses, axis=-1), axis=-1)
+        finest_start = int(scale_starts[-1])
+        finest_end = int(scale_ends[-1])
+        finest_block_loss = jnp.mean(token_loss[:, finest_start:finest_end], axis=-1)
+        metric_info["msp_loss_total"] = jnp.mean(weighted_total)
+        metric_info["msp_loss_finest"] = jnp.mean(finest_block_loss)
+        metric_info["msp_loss_finest_weighted"] = jnp.mean(weighted_block_losses[-1])
+
+        return weighted_total[:, None], metric_info
 
     def _sample_msp_actions(self, observation: _model.Observation) -> _model.Actions:
         assert self.msp_scales is not None
@@ -308,14 +337,16 @@ class Pi0(_model.BaseModel):
             suffix_tokens, suffix_mask, adarms_cond, rope_positions = self._embed_msp_suffix(
                 latent_inputs,
                 current_scale,
-                pos_start=block_start,
-                pos_end=block_end,
+                block_index=block_idx,
             )
-            previous_suffix_len = sum(self.msp_scales[:block_idx])
-            suffix_attn_mask = jnp.ones((batch_size, current_scale[0], previous_suffix_len + current_scale[0]), dtype=jnp.bool_)
+            suffix_attn_mask = msp_scale_head.build_current_block_attention_mask(
+                self.msp_scales,
+                block_idx,
+                batch_size=batch_size,
+            )
             prefix_attn_mask = jnp.broadcast_to(prefix_mask[:, None, :], (batch_size, current_scale[0], prefix_mask.shape[1]))
             attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            start = prefix_mask.shape[1] + previous_suffix_len
+            start = prefix_mask.shape[1] + block_start
             positions = jnp.broadcast_to(
                 jnp.arange(start, start + current_scale[0], dtype=jnp.int32)[None, :],
                 (batch_size, current_scale[0]),
@@ -330,14 +361,15 @@ class Pi0(_model.BaseModel):
             )
             diffusion_pos = self._msp_pos_slice(
                 self.msp_diffusion_pos_embed,
-                start=block_start,
-                end=block_end,
+                block_index=block_idx,
                 dtype=suffix_out.dtype,
             )
+            assert diffusion_pos.shape[1] == current_scale[0]
             pred_latents = self.msp_latent_out_proj(suffix_out[:, -current_scale[0] :] + diffusion_pos)
             generated_blocks.append(pred_latents)
 
-        return self.msp_action_vae(generated_blocks[-1], train=False, method="get_action")
+        decoded_actions = self.msp_action_vae(generated_blocks[-1], train=False, method="get_action")
+        return self._pad_msp_actions(decoded_actions)
 
     @at.typecheck
     def embed_suffix(
@@ -418,6 +450,15 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+    @override
+    def compute_loss_with_info(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
+        if self.use_msp_action_head:
+            preprocess_rng, _ = jax.random.split(rng)
+            return self._compute_msp_loss_with_info(preprocess_rng, observation, actions, train=train)
+        return super().compute_loss_with_info(rng, observation, actions, train=train)
 
     @override
     def sample_actions(

@@ -136,6 +136,14 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
+                pad_transform: _transforms.DataTransformFn
+                if model_config.use_msp_action_head and model_config.msp_action_dim is not None:
+                    pad_transform = _transforms.PadToDims(
+                        state_dim=model_config.action_dim,
+                        action_dim=model_config.msp_action_dim,
+                    )
+                else:
+                    pad_transform = _transforms.PadStatesAndActions(model_config.action_dim)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -144,7 +152,7 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        pad_transform,
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -705,8 +713,8 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             use_msp_action_head=True,
-            action_dim=14,
             action_horizon=32,
+            msp_action_dim=14,
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="RoboDojo_sim_arx-x5_v30",
@@ -734,7 +742,10 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*lora.*|.*msp.*",
+        ),
         batch_size=128,
         fsdp_devices=2,
         num_train_steps=60_000,

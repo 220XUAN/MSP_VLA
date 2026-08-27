@@ -24,6 +24,12 @@ def resize_sequence(x: jnp.ndarray, target_length: int) -> jnp.ndarray:
 
 
 def build_scale_ar_mask(scales: tuple[int, ...]) -> jnp.ndarray:
+    """Compatibility helper for big_vision-style blockwise AR masks.
+
+    `True` marks the first token of a new scale block. This makes cumsum-based
+    attention treat each scale as one fully-connected block that can attend to
+    all previous blocks.
+    """
     mask = []
     for scale in scales:
         mask.extend([True] + ([False] * (scale - 1)))
@@ -41,6 +47,41 @@ def build_scale_segment_bounds(scales: tuple[int, ...]) -> tuple[jnp.ndarray, jn
     return starts, ends
 
 
+def slice_scale_positions(pos_embed: jnp.ndarray, scales: tuple[int, ...], block_index: int | None) -> jnp.ndarray:
+    """Training uses the full learned position table; inference slices one scale block."""
+    if block_index is None:
+        return pos_embed
+    starts, ends = build_scale_segment_bounds(scales)
+    start = int(starts[block_index])
+    end = int(ends[block_index])
+    return pos_embed[:, start:end, :]
+
+
+def build_blockwise_visibility(scales: tuple[int, ...]) -> jnp.ndarray:
+    """Build the exact MSP block-wise suffix visibility matrix.
+
+    For each scale block, all tokens in that block can attend to:
+    - every token in coarser scales
+    - every token in the same scale
+    - no token in finer scales
+    """
+    total_length = sum(scales)
+    rows = []
+    visible = 0
+    for scale in scales:
+        visible += scale
+        rows.append(
+            jnp.concatenate(
+                [
+                    jnp.ones((scale, visible), dtype=jnp.bool_),
+                    jnp.zeros((scale, total_length - visible), dtype=jnp.bool_),
+                ],
+                axis=-1,
+            )
+        )
+    return jnp.concatenate(rows, axis=0)
+
+
 def build_suffix_block_attention_mask(
     scales: tuple[int, ...],
     *,
@@ -48,23 +89,32 @@ def build_suffix_block_attention_mask(
     input_mask: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     total_length = sum(scales)
-    rows = []
-    visible = 0
-    for scale in scales:
-        visible += scale
-        row = jnp.concatenate(
-            [
-                jnp.ones((scale, visible), dtype=jnp.bool_),
-                jnp.zeros((scale, total_length - visible), dtype=jnp.bool_),
-            ],
-            axis=-1,
-        )
-        rows.append(row)
-    mask = jnp.concatenate(rows, axis=0)
+    mask = build_blockwise_visibility(scales)
     mask = jnp.broadcast_to(mask[None, :, :], (batch_size, total_length, total_length))
     if input_mask is not None:
         valid = input_mask[:, :, None] & input_mask[:, None, :]
         mask = mask & valid
+    return mask
+
+
+def build_current_block_attention_mask(
+    scales: tuple[int, ...],
+    block_index: int,
+    *,
+    batch_size: int,
+    input_mask: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Build inference-time suffix attention mask for the current scale block."""
+    visibility = build_blockwise_visibility(scales)
+    starts, ends = build_scale_segment_bounds(scales)
+    start = int(starts[block_index])
+    end = int(ends[block_index])
+    mask = visibility[start:end, :end]
+    mask = jnp.broadcast_to(mask[None, :, :], (batch_size, end - start, end))
+    if input_mask is not None:
+        valid_query = input_mask[:, start:end, None]
+        valid_key = input_mask[:, None, :end]
+        mask = mask & valid_query & valid_key
     return mask
 
 
