@@ -2,6 +2,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def default_msp_scales(latent_horizon: int) -> tuple[int, ...]:
@@ -41,9 +42,10 @@ def build_block_local_positions(scales: tuple[int, ...], *, batch_size: int) -> 
     return jnp.broadcast_to(positions[None, :], (batch_size, positions.shape[0]))
 
 
-def build_scale_segment_bounds(scales: tuple[int, ...]) -> tuple[jnp.ndarray, jnp.ndarray]:
-    ends = jnp.cumsum(jnp.asarray(scales, dtype=jnp.int32))
-    starts = ends - jnp.asarray(scales, dtype=jnp.int32)
+def build_scale_segment_bounds(scales: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+    """Returns static numpy arrays so segment bounds stay concrete under jit."""
+    ends = np.cumsum(scales, dtype=np.int32)
+    starts = ends - np.asarray(scales, dtype=np.int32)
     return starts, ends
 
 

@@ -247,17 +247,23 @@ class Pi0(_model.BaseModel):
         return jnp.pad(actions, pad_width)
 
     def _compute_msp_loss(
-        self, preprocess_rng: at.KeyArrayLike | None, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        loss, _ = self._compute_msp_loss_with_info(preprocess_rng, observation, actions, train=train)
+        loss, _ = self._compute_msp_loss_with_info(rng, observation, actions, train=train)
         return loss
 
     def _compute_msp_loss_with_info(
-        self, preprocess_rng: at.KeyArrayLike | None, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         assert self.msp_scales is not None
+        preprocess_rng, latent_rng = jax.random.split(rng)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        finest_latent = self.msp_action_vae(self._select_msp_actions(actions), train=False, method="encode_mean")
+        finest_latent = self.msp_action_vae(
+            self._select_msp_actions(actions),
+            latent_rng,
+            train=False,
+            method="get_sample",
+        )
         input_latents, target_latents = msp_scale_head.build_teacher_forced_inputs(finest_latent, self.msp_scales)
         total_suffix_len = target_latents.shape[1]
 
@@ -425,8 +431,7 @@ class Pi0(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         if self.use_msp_action_head:
-            preprocess_rng, _ = jax.random.split(rng)
-            return self._compute_msp_loss(preprocess_rng, observation, actions, train=train)
+            return self._compute_msp_loss(rng, observation, actions, train=train)
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -456,8 +461,7 @@ class Pi0(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         if self.use_msp_action_head:
-            preprocess_rng, _ = jax.random.split(rng)
-            return self._compute_msp_loss_with_info(preprocess_rng, observation, actions, train=train)
+            return self._compute_msp_loss_with_info(rng, observation, actions, train=train)
         return super().compute_loss_with_info(rng, observation, actions, train=train)
 
     @override

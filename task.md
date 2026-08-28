@@ -725,6 +725,482 @@ Stage-2 训练命令：
 - `openpi/src/openpi/models/pi0.py`
 - `task.md`
 
+## 2026-08-28 MSP VAE 配置补充：`kl_weight` 默认改为 `1e-6`，并通过 `Pi0Config` 透传
+
+需求：
+- `openpi/src/openpi/models/pi0_config.py` 中：
+  - `MspActionVAEConfig.kl_weight` 默认从 `1e-5` 改成 `1e-6`
+- 并且在 `Pi0Config` 里把这个参数也挂出来，和 `msp_latent_dim` 一样可配置，再传入 Stage-2 内部构造的 `msp_action_vae`
+
+本轮修改：
+- 文件：`openpi/src/openpi/models/pi0_config.py`
+
+1. `Pi0Config` 新增：
+- `msp_kl_weight: float = 1e-6`
+
+2. `make_msp_vae_config()` 透传：
+- `kl_weight=self.msp_kl_weight`
+
+3. `MspActionVAEConfig` 默认值修改：
+- `kl_weight: float = 1e-6`
+
+当前效果：
+- Stage-1 直接使用 `MspActionVAEConfig(...)` 时，默认 `kl_weight` 已经是 `1e-6`
+- Stage-2 通过 `Pi0Config.make_msp_vae_config()` 构造内部 `msp_action_vae` 时，也会带上：
+  - `msp_kl_weight`
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/pi0_config.py`
+- `git diff --check -- openpi/src/openpi/models/pi0_config.py`
+
+本轮修改文件：
+- `openpi/src/openpi/models/pi0_config.py`
+- `task.md`
+
+## 2026-08-28 审计结论：当前 pi0.5 里的 MSP 还没有“完全移植”，而是“按 pi0.5 结构约束做了核心机制适配”
+
+这次对照了：
+- 原版：
+  - `MSP/algos/MSP.py`
+  - `MSP/algos/flow/flow_ar.py`
+  - `MSP/algos/vae/vae.py`
+- 当前实现：
+  - `openpi/src/openpi/models/pi0.py`
+  - `openpi/src/openpi/models/msp_vae.py`
+  - `openpi/src/openpi/models/msp_scale_head.py`
+
+结论先说：
+- **Stage 1 VAE：大体移植完成，但不是逐层 1:1 复刻**
+- **Stage 2 MSP 头：核心机制大体接上了，但不是原版 FlowAR 的完整移植**
+- **整体上不是“完全移植”**
+- 更准确地说，是：
+  - **在保留 pi0.5 VLM / Gemma 主干不动的前提下，移植了 MSP 的多尺度 latent 生成思路**
+
+### 一、已经对齐的部分
+
+1. 两阶段训练拆分
+- Stage 1：动作 VAE 单独训练
+- Stage 2：观测 + latent scale autoregressive head
+- 这一点和原版 MSP 设计一致
+
+2. Stage 1 -> Stage 2 的 VAE 权重复用
+- Stage 2 会把 Stage 1 的 `action_vae/*` remap 到 `msp_action_vae/*`
+- 这一点已经打通
+
+3. Stage 2 的 latent target 来源
+- 现在已经从 `encode_mean` 改成 `get_sample`
+- 和原版 `self.autoencoder.get_sample(action)` 对齐
+
+4. 多尺度 teacher-forcing 训练思路
+- finest latent -> 多尺度 target
+- 训练时输入前一尺度上采样/重采样结果
+- 推理时逐尺度生成 finest latent
+- 这条 coarse-to-fine 主线已经接上
+
+5. block-wise scale mask
+- 同尺度全可见
+- 可看更粗尺度
+- 不可看更细尺度
+- 训练和推理都已统一
+
+6. 三组 learned positional embeddings
+- `encoder_pos_embed`
+- `decoder_pos_embed`
+- `diffusion_pos_embed`
+- 训练全长、推理按 `start:end` 对应 block 切片，这一点已经补上
+
+7. block-local RoPE 语义
+- suffix 已经通过 `rope_positions` 覆盖为“每个尺度段内部从 0 开始”
+- 这点机制上已经成立
+
+8. 原版的尺度加权 loss 汇总
+- 已经按 `scale / max_scale` 汇总到 Stage 2 总 loss
+
+### 二、没有完全移植的部分
+
+1. **最大的差异：Stage 2 不是原版的 `FlowAR + MPScalseFlowhead`**
+
+原版：
+- `flow_ar.py` 里不是直接输出 latent 然后做 MSE
+- 而是：
+  - `forward_mae_encoder`
+  - `forward_mae_decoder`
+  - 再接 `MPScalseFlowhead`
+- 每个尺度 block 的监督来自 `flownet(...)`
+
+当前实现：
+- `pi0.py` 里是：
+  - 用 pi0.5 的 Gemma action expert 作为多尺度 latent token transformer
+  - 直接预测 latent
+  - loss 是 latent MSE，再加尺度权重
+
+这意味着：
+- **当前 Stage 2 还不是原版 MSP 的 flow/diffusion head**
+- 只是保留了多尺度自回归 latent 框架
+
+这是目前最本质的未完全移植点。
+
+2. **原版 FlowAR 的双塔结构没有 1:1 复刻**
+
+原版 `flow_ar.py`：
+- 有显式的
+  - `z_proj`
+  - `z_proj_ln`
+  - `forward_mae_encoder`
+  - `decoder_embed`
+  - `forward_mae_decoder`
+- 也就是“encoder stack + decoder stack”两段式结构
+
+当前 `pi0.py`：
+- 没有单独复刻这两套 block
+- 而是把 MSP suffix token 直接送进现有 Gemma action expert
+
+所以：
+- **结构思路相近**
+- **但不是原版 FlowAR 模块逐层移植**
+
+3. **原版的 `cls / obs token` 位置语义和当前实现不完全一样**
+
+原版：
+- `x_input` 是 `next_scale` 的输入块
+- 再前面拼一个 `cls = fusion_obs(context).unsqueeze(1)`
+- 所以第一个位置本质上是观察条件 token
+
+当前实现：
+- 观察条件来自 pi0.5 的 prefix（图像 token + 文本 token）
+- suffix 里全是多尺度 latent token
+- 没有把原版那个单独的 `cls` token 作为 suffix 第一位 1:1 塞进去
+
+这点是**有意适配 pi0.5 结构**后的差异，不是 bug，但确实不等于原版。
+
+4. **原版 block 内的调制方式和当前实现不同**
+
+原版 `Block`：
+- 每层用 `ada_lin(condition)` 生成
+  - `gamma`
+  - `scale`
+  - `shift`
+- 是显式条件调制
+
+当前 `pi0.py`：
+- suffix 主要通过：
+  - prefix attention
+  - learned pos/scale embeddings
+  - Gemma 自身 attention
+  来感知观测
+- `adarms_cond` 目前是全零，不等于原版 `condition=cls`
+
+这也是一个重要差异：
+- **原版每层都有显式 condition modulation**
+- **当前实现没有把 obs embedding 直接作为每层调制条件送进去**
+
+5. **Stage 1 VAE 不是逐层 1:1 复刻**
+
+虽然 Stage 1 已经比较接近，但仍有实现层面的差别：
+- 原版用的是 PyTorch `TransformerEncoder/Decoder`
+- 原版 encoder/decoder 的 norm/实现细节、position embedding 工具、层初始化都不是逐项照搬
+- 当前 JAX 版是按同等结构重写，不是字节级复刻
+
+不过这部分我认为是：
+- **结构等价度较高**
+- **足够称为“已移植”**
+- 不像 Stage 2 那么有本质差异
+
+### 三、哪些差异是“故意保留”的
+
+1. VLM / prefix 不动
+- 这是你一开始就明确要求的
+- 所以 observation encoder 不会像原版 MSP 那样走 `FilmResNet + language proj + proprio concat`
+- 而是保留 pi0.5 原始 VLM prefix
+
+2. 动作维度与 pi0.5 兼容
+- `action_dim=32` 继续给 pi0.5 主干
+- `msp_action_dim=14` 单独给 MSP VAE
+- 这是为了让 pi0.5 base checkpoint 可加载，不属于原版 MSP 设计
+
+### 四、最终判断
+
+如果问题是：
+- **“核心 MSP 思路有没有接进 pi0.5？”**
+答案是：**有，而且主线已经打通。**
+
+如果问题是：
+- **“是否已经把原版 MSP 完整移植到了 pi0.5？”**
+答案是：**没有。**
+
+最准确的说法是：
+- 现在的实现是 **MSP-on-pi0.5**
+- 不是原版 **MSP FlowAR 模块的完整 JAX 复刻**
+
+### 五、离“更完整移植”还差什么
+
+如果你要继续逼近原版，下一步优先级应该是：
+
+1. **把 Stage 2 的 latent MSE 头换成原版 `MPScalseFlowhead` 风格**
+- 这是最大差异
+
+2. **把 obs condition 直接注入每层调制**
+- 也就是更接近原版 `ada_lin(condition)` 的作用方式
+
+3. **如果你要极致对齐，再考虑是否复刻独立的 encoder/decoder stack**
+- 而不是继续复用 Gemma action expert
+
+当前结论：
+- **没有完全移植**
+- **已经移植了 MSP 的关键训练范式、多尺度 mask/位置编码/逐尺度推理框架**
+- **但 Stage 2 的核心预测头仍然不是原版 MSP 的 flow head**
+
+## 2026-08-28 部署配置适配：`deploy.yml` 切到 `pi05+msp stage2`
+
+判断结果：
+- `deploy.py` 本身只是 rollout 逻辑，不依赖“原始 pi0.5 头”还是“MSP 头”
+- 实际加载哪个模型，取决于：
+  - `model.py`
+  - `deploy.yml` 中的 `train_config_name` / checkpoint 信息
+
+所以这一步只需要改 `deploy.yml`，不需要改 `deploy.py`
+
+本轮修改：
+- 文件：`deploy.yml`
+
+1. `train_config_name`
+- 从：
+  - `pi05_base_aloha_full_sim_arx-x5_seed_0`
+- 改为：
+  - `pi05_msp_stage2_aloha_arx-x5_seed_0`
+
+2. `checkpoint_num`
+- 从：
+  - `59999`
+- 改为：
+  - `29999`
+
+3. `result_dir`
+- 从：
+  - `./results/pi05/`
+- 改为：
+  - `./results/pi05_msp_stage2/`
+
+说明：
+- 部署时不会再去单独加载 stage1/base 预训练权重
+- 只会直接加载你保存好的 Stage-2 checkpoint
+- 前提是你评估时指向的是正确的 Stage-2 checkpoint 目录
+
+如果实际部署 checkpoint step 不是 `29999`，需要继续改：
+- `deploy.yml: checkpoint_num`
+
+本轮修改文件：
+- `deploy.yml`
+- `task.md`
+
+## 2026-08-28 部署加载链判断：`model.py` 当前不需要为 `pi05+msp stage2` 额外改权重加载逻辑
+
+这一步重新核对了部署时的真实加载链：
+
+1. `model.py`
+- 读取 `deploy.yml` 的：
+  - `train_config_name`
+  - `checkpoint_num`
+  - `ckpt_name / model_path / checkpoint_path`
+
+2. `model.py -> create_trained_policy(...)`
+- 文件：`openpi/src/openpi/policies/policy_config.py`
+- 这里直接做的是：
+  - `train_config.model.load(_model.restore_params(checkpoint_dir / "params", ...))`
+
+3. `BaseModelConfig.load(...)`
+- 文件：`openpi/src/openpi/models/model.py`
+- 这里是：
+  - 先按 `train_config.model` 创建完整模型结构
+  - 再把 checkpoint 里的 `params` 直接载入这个完整结构
+
+4. 训练保存
+- 文件：`openpi/src/openpi/training/checkpoints.py`
+- `save_state(...)` 会把当前训练时的完整可推理参数单独保存到：
+  - `params`
+
+结论：
+- **部署时不会再走训练时的 `weight_loader`**
+- **也不会再走 `merge_msp_vae_params(...)`**
+- 这些逻辑只发生在 Stage-2 训练初始化阶段
+
+所以：
+- 如果你部署的是一个**已经训练并保存完成的 Stage-2 checkpoint**
+  - 它的 `params` 里已经包含：
+    - pi0.5 base 主干权重
+    - stage1 注入后的 `msp_action_vae/*`
+    - stage2 学出来的 `msp_*` 头
+  - 那么 `model.py` **不需要改**
+
+- 只有在一种情况下才需要改 `model.py`：
+  - 你不想加载完整 Stage-2 checkpoint
+  - 而是想在部署时临时从：
+    - pi0.5 base checkpoint
+    - + stage1 VAE checkpoint
+    - + 当前随机/部分 stage2 参数
+    重新拼装模型
+  - 这种做法当前部署链不支持，也不建议这么做
+
+当前判断：
+- **现在为了适配 `pi05+msp stage2`，改 `deploy.yml` 就够了**
+- **`model.py` 不需要同步改权重加载逻辑**
+
+补充：
+- `deploy.py` 也不需要因为权重加载而改
+- 它只负责 rollout，不负责 checkpoint 组合
+
+## 2026-08-28 Stage-2 权重加载修复：先用完整模型形状合并 MSP VAE，再覆盖 base checkpoint
+
+报错现象：
+- Stage-2 在加载 `msp_vae_weight_path` 时触发：
+  - `No remapped MSP VAE parameters matched the stage-2 model.`
+
+根因分析：
+- 这个判断是正确的。
+- `init_train_state()` 里原本的顺序是：
+  1. `_load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())`
+  2. 返回 `partial_params`
+  3. 把这个 `partial_params` 传给 `merge_msp_vae_params(...)`
+- 问题在于：
+  - `_load_weights_and_validate(...)` 会去掉所有未从 base checkpoint 实际加载到的 `ShapeDtypeStruct`
+  - 因为原始 pi0.5 checkpoint 里没有 `msp_action_vae/*`
+  - 所以返回的 `partial_params` 里也没有 `msp_action_vae/*` 这些 key
+- 结果：
+  - `merge_msp_vae_params(partial_params, ...)` 在 `flat_ref` 中找不到 `msp_action_vae/*`
+  - `matched` 为空
+  - 于是报错
+
+修复策略：
+- 不能用“已经裁掉 MSP key 的 base partial params”作为 stage1 VAE merge 的参考树
+- 必须先用**完整模型参数形状**做参考，把 stage1 VAE 合并进去
+- 然后再把 base checkpoint 的真实已加载参数覆盖上去
+
+本轮修改：
+1. `train.py` 和 `train_tb.py` 调整加载顺序
+- 文件：
+  - `openpi/scripts/train.py`
+  - `openpi/scripts/train_tb.py`
+- 新顺序：
+  1. `full_shape = train_state_shape.params.to_pure_dict()`
+  2. `base_params = _load_weights_and_validate(config.weight_loader, full_shape)`
+  3. `stage1_params = merge_msp_vae_params(full_shape, config.msp_vae_weight_path)`
+  4. `partial_params = merge(base_params over stage1_params)`
+
+2. 新增 `_merge_partial_params(...)`
+- 文件：
+  - `openpi/scripts/train.py`
+  - `openpi/scripts/train_tb.py`
+- 用途：
+  - 把 `base_params` 覆盖到 `stage1_params` 上
+  - 同时去掉残留的 `jax.ShapeDtypeStruct`
+
+当前效果：
+- Stage-1 VAE merge 时，参考树里已经包含 `msp_action_vae/*`
+- 所以 `merge_msp_vae_params(...)` 可以正确找到 remapped key
+- 然后再用 base checkpoint 覆盖公共主干权重
+- 最终得到的是：
+  - pi0.5 base 权重
+  - + stage1 MSP VAE 权重
+  - + 其余 `msp_*` 新增头随机初始化
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/scripts/train.py openpi/scripts/train_tb.py`
+- `git diff --check -- openpi/scripts/train.py openpi/scripts/train_tb.py`
+
+本轮修改文件：
+- `openpi/scripts/train.py`
+- `openpi/scripts/train_tb.py`
+- `task.md`
+
+## 2026-08-28 JAX tracer 修复：`build_scale_segment_bounds` 改成静态 numpy 边界
+
+报错现象：
+- Stage-2 训练在 `jit(train_step)` 内触发：
+  - `jax.errors.ConcretizationTypeError`
+- 具体点位是：
+  - `start = int(scale_starts[block_idx])`
+
+根因：
+- 这个判断也是正确的。
+- `build_scale_segment_bounds(scales)` 之前返回的是 `jnp.ndarray`
+- 在 `jax.jit` 里，这些值会变成 tracer
+- tracer 不能被 Python 的 `int()` 转成具体值
+
+而这里的 `scales` 本质上是静态配置：
+- 它来自 `tuple[int, ...]`
+- 不是运行时动态张量
+
+所以这组 segment bounds 没必要用 `jnp`
+
+本轮修改：
+- 文件：`openpi/src/openpi/models/msp_scale_head.py`
+- 将：
+  - `build_scale_segment_bounds(scales) -> tuple[jnp.ndarray, jnp.ndarray]`
+- 改为：
+  - `build_scale_segment_bounds(scales) -> tuple[np.ndarray, np.ndarray]`
+
+实现方式：
+- `ends = np.cumsum(scales, dtype=np.int32)`
+- `starts = ends - np.asarray(scales, dtype=np.int32)`
+
+效果：
+- `starts/end` 现在是静态 numpy 数组
+- 在 `jit` 内部不会变成 JAX tracer
+- 所以可以安全地用于：
+  - `int(starts[idx])`
+  - `int(ends[idx])`
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/msp_scale_head.py openpi/src/openpi/models/pi0.py openpi/scripts/train.py openpi/scripts/train_tb.py`
+- `git diff --check -- openpi/src/openpi/models/msp_scale_head.py`
+
+本轮修改文件：
+- `openpi/src/openpi/models/msp_scale_head.py`
+- `task.md`
+
+## 2026-08-28 Stage-2 latent target 对齐原版 MSP：从 `encode_mean` 改为 `get_sample`
+
+问题背景：
+- 之前 Stage-2 在 `pi0.py` 里使用的是：
+  - `msp_action_vae(..., method="encode_mean")`
+- 但原版 `MSP/algos/MSP.py` 在 `compute_flowscale_loss()` 里用的是：
+  - `self.autoencoder.get_sample(action)`
+
+这两者的区别：
+- `encode_mean`
+  - 取 posterior 的均值
+  - target 更稳定、更确定
+- `get_sample`
+  - 从 posterior 中采样
+  - 更忠实原版 MSP 的训练方式
+
+本轮修改：
+- 文件：`openpi/src/openpi/models/pi0.py`
+- Stage-2 的 `_compute_msp_loss_with_info(...)` 改为：
+  1. 从训练 RNG 中切出：
+     - `preprocess_rng`
+     - `latent_rng`
+  2. 用：
+     - `msp_action_vae(..., latent_rng, method="get_sample", train=False)`
+     生成 `finest_latent`
+
+这意味着现在 Stage-2 的 latent supervision：
+- 不再是固定的 posterior mean
+- 而是和原版 MSP 一样，使用 VAE posterior sample
+
+当前效果：
+- Stage-2 更忠实原版 MSP
+- latent target 会带有 VAE posterior sampling 的随机性
+- 训练目标仍然是多尺度 latent 预测，只是 target 来源从 mean 改成了 sample
+
+本轮验证：
+- `openpi/.venv/bin/python -m py_compile openpi/src/openpi/models/pi0.py`
+- `git diff --check -- openpi/src/openpi/models/pi0.py`
+
+本轮修改文件：
+- `openpi/src/openpi/models/pi0.py`
+- `task.md`
+
 ## 2026-08-27 Stage-2 loss 对齐：接入原版 MSP 的尺度加权机制
 
 你指出的这一点是对的。原版 MSP 在 `MSP/algos/flow/flow_ar.py` 里不是把所有尺度 token loss 直接平均，而是：

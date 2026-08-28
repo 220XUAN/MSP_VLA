@@ -47,6 +47,7 @@ class Pi0Config(_model.BaseModelConfig):
     msp_decoder_heads: int = 4
     msp_decoder_layers: int = 4
     msp_latent_dim: int = 16
+    msp_kl_weight: float = 1e-6
     msp_latent_horizon: int | None = None
     msp_scales: tuple[int, ...] | None = None
 
@@ -176,6 +177,7 @@ class Pi0Config(_model.BaseModelConfig):
             decoder_heads=self.msp_decoder_heads,
             decoder_layers=self.msp_decoder_layers,
             latent_dim=self.msp_latent_dim,
+            kl_weight=self.msp_kl_weight,
         )
 
 
@@ -202,7 +204,7 @@ class MspActionVAEConfig(_model.BaseModelConfig):
     decoder_heads: int = 4
     decoder_layers: int = 4
     latent_dim: int = 16
-    kl_weight: float = 1e-5
+    kl_weight: float = 1e-6
 
     def __post_init__(self):
         if self.downsample_factor < 1 or 2 ** int(math.log2(self.downsample_factor)) != self.downsample_factor:

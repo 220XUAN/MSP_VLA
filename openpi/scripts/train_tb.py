@@ -71,6 +71,17 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     )
 
 
+def _merge_partial_params(preferred_params: at.Params, fallback_params: at.Params) -> at.Params:
+    """Overlay preferred loaded params on top of a fallback pytree, dropping shape structs."""
+    flat_fallback = traverse_util.flatten_dict(fallback_params, sep="/")
+    flat_preferred = traverse_util.flatten_dict(preferred_params, sep="/")
+    flat_fallback.update(flat_preferred)
+    return traverse_util.unflatten_dict(
+        {k: v for k, v in flat_fallback.items() if not isinstance(v, jax.ShapeDtypeStruct)},
+        sep="/",
+    )
+
+
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
@@ -110,12 +121,16 @@ def init_train_state(
         return train_state_shape, state_sharding
 
     logger.info("Loading base model weights with loader: %s", type(config.weight_loader).__name__)
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    full_shape = train_state_shape.params.to_pure_dict()
+    base_params = _load_weights_and_validate(config.weight_loader, full_shape)
     logger.info("Base model weight load succeeded.")
     if config.msp_vae_weight_path is not None:
         logger.info("Loading MSP stage-1 weights from %s", config.msp_vae_weight_path)
-        partial_params = _weight_loaders.merge_msp_vae_params(partial_params, config.msp_vae_weight_path)
+        stage1_params = _weight_loaders.merge_msp_vae_params(full_shape, config.msp_vae_weight_path)
+        partial_params = _merge_partial_params(base_params, stage1_params)
         logger.info("MSP stage-1 weight load succeeded.")
+    else:
+        partial_params = base_params
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.
