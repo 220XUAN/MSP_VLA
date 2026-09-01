@@ -385,7 +385,7 @@ class MspActionVAE(_model.BaseModel):
         total_loss = recon_loss + weighted_kl_loss
         return total_loss, {
             "recon_loss": jnp.mean(recon_loss),
-            "kl_loss": jnp.mean(weighted_kl_loss),
+            "kl_loss": jnp.mean(kl_loss),
         }
 
     @override

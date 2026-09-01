@@ -3443,3 +3443,138 @@ checkpoint 结论：
 - `openpi/src/openpi/models/pi0.py`
 - `openpi/src/openpi/models/msp_vae_test.py`
 - `task.md`
+
+## 2026-09-01 Stage-2 Flow 推理链路复核与接口补全
+
+新的理解：
+- Flow 推理发生在 `Pi0.sample_actions()` 内部：VLM prefix 只编码一次，每个尺度由 Gemma action expert 给出 condition，MeanFlow 从该尺度高斯 latent noise 单步生成 latent，最细尺度再由 Stage-1 VAE decoder 解码动作。
+- `deploy.py -> model.py -> Policy.infer()` 是通用部署包装，不应复制 Flow 算法。部署使用 MSP Stage-2 train config 创建模型并恢复完整 checkpoint 后，会自动进入上述分支。
+- `Policy.infer()` 每次调用都会 split JAX RNG；未显式传 noise 时，各次推理和各尺度均使用不同高斯噪声。
+- VAE 解码先得到归一化动作，模型补齐 openpi 的 32 维接口后，output transform 再反归一化；机器人适配层最后按实际动作维度解包。
+
+发现并修复的问题：
+- MSP 分支此前直接丢弃公开推理接口的 `noise` 参数，无法固定噪声复现实验。
+- 现在 MSP 模式允许 `noise` 使用 `[B, sum(msp_scales), msp_latent_dim]`，并严格按尺度段切分后分别送入 Flow head。
+- 不传 `noise` 时行为不变：使用传入 RNG 为每个尺度独立采样高斯 latent。
+- 如果误传原 pi0.5 的 action-space noise（例如 `[B, 32, 14]`），现在会给出明确 shape 错误，不再静默忽略。
+
+本轮修改文件：
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/msp_scale_head.py`
+- `openpi/src/openpi/models/msp_scale_head_test.py`
+- `task.md`
+
+验证结果：
+- `msp_scale_head_test.py + msp_flow_head_test.py`：`13 passed`。
+- `py_compile` 和 `git diff --check` 通过。
+- 没有真实 Stage-2 checkpoint 和仿真环境，因此本地未执行完整 VLM + Flow + VAE decoder 部署推理；服务器评估必须使用包含 `msp_flow_head/*` 的新 Stage-2 checkpoint，旧的直接 latent-MSE checkpoint 不兼容。
+
+## 2026-09-01 按原版 `FlowAR.sample_tokens()` 收紧推理逻辑
+
+逐行对齐基准：
+- `MSP/algos/flow/flow_ar.py::FlowAR.sample_tokens()`
+- `MSP/algos/flow/flow_ar.py::forward_mae_decoder()`
+
+确认已对齐的行为：
+1. VLM prefix 只前向一次并建立 KV cache，对应原版进入尺度循环前清理并重新建立 attention cache。
+2. 每次循环只输入当前尺度 block；当前 block 能看 prefix、全部旧尺度 cache 和当前尺度全部 token。
+3. 每个尺度独立采样高斯 latent，并调用原版单步 MeanFlow：`sample - u(sample, t=1, r=0)`。
+4. 非最终尺度的生成结果先 resize 到 finest scale，再 resize 到下一尺度，作为下一轮 Transformer 输入。
+5. 最终只取 finest latent，送 Stage-1 VAE decoder 得到动作。
+
+发现并修复的差异：
+- 原版 decoder 输出在进入 Flow head 前会加 `diffusion_pos_embed_learned`，推理使用 `[:, start:end]`；当前实现此前缺少这一步。
+- 新增 `msp_flow_pos_embed`，初始化为原版 `normal(std=0.02)`。
+- Stage-2 训练时给整段 Gemma condition 加完整位置表。
+- 推理时按当前 `block_index` 对应的累计尺度边界严格切 `start:end`，再送 Flow head。
+- 上一尺度生成 latent 在传给下一尺度前显式 `stop_gradient`，对应原版 `z_sample.detach()`；推理数值不变，但语义与原版一致。
+
+没有硬搬的结构：
+- 原版有独立 MAE encoder 和 decoder，因此各自需要一组 learned position；pi0.5 适配后只有一个 Gemma action expert，并已使用 block-local RoPE、global cache position 和 MINT level embedding。
+- 因此这里只保留与 Flow condition 一一对应的 `msp_flow_pos_embed`，不在同一个 Gemma 输入上重复叠加 encoder/decoder 两组位置参数。
+
+checkpoint 影响：
+- 新参数路径为 `msp_flow_pos_embed`，加载原始 pi0.5 base 时由现有 `.*msp.*` 规则跳过并随机初始化。
+- 该参数参与 Stage-2 训练，必须使用本次修改后重新训练的 Stage-2 checkpoint；旧 Stage-2 完整 checkpoint 缺少该参数，不能严格恢复为当前结构。
+
+本轮修改文件：
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/msp_scale_head.py`
+- `openpi/src/openpi/models/msp_scale_head_test.py`
+- `task.md`
+
+验证结果：
+- `msp_scale_head_test.py + msp_flow_head_test.py`：`14 passed`。
+- `py_compile` 和 `git diff --check` 通过。
+- `msp_gemma_cache_test.py` 在临时 CPU 环境收集阶段缺少 openpi 完整依赖；已按阿里云镜像补充 `einops`，随后仍缺少 `beartype/jaxtyping/torch`。本轮未修改 Gemma/cache 路径，因此没有继续安装整套 Torch；完整集成验证留给服务器现有 openpi 环境。
+
+## 2026-09-01 关于正在运行的旧版 Stage-2 训练
+
+结论：
+- 最近一次修改不只是推理修改。
+- `noise` 分尺度切片和推理尺度循环属于纯推理接口修改，不要求重新训练。
+- 但新增的 `msp_flow_pos_embed` 同时接入了 Stage-2 训练的 Flow condition，并新增了可训练参数，因此旧版正在训练的 checkpoint 不包含该参数。
+- 已经启动的旧训练进程加载的是启动时的旧 Python 程序，不受工作区后续代码修改影响，可以继续完成；但它产出的 checkpoint 应使用对应旧版代码推理。
+- 如果要使用当前包含 `msp_flow_pos_embed[:, start:end]` 的严格对齐版本，Stage-2 应从 pi0.5 base + Stage-1 VAE 重新训练。
+- 不建议在加载旧 checkpoint 时随机补 `msp_flow_pos_embed` 后直接推理，因为该位置参数没有参与旧版训练，会给 Flow condition 引入未训练扰动。
+
+## 2026-09-01 暂时关闭 `msp_flow_pos_embed`
+
+需求：
+- 先使用当前代码加载并评估上一版正在训练的 Stage-2 checkpoint。
+- 等旧版实验完成后，再选择是否启用原版 MSP 风格的 Flow condition learned position。
+
+实现：
+- `Pi0Config` 新增 `msp_use_flow_pos_embed: bool = False`，默认关闭。
+- `pi05_msp_stage2_aloha_arx-x5_seed_0` 中也显式设置为 `False`，后续实验只需在该配置改成 `True`。
+- 关闭时不创建 `msp_flow_pos_embed` 参数，训练和推理的 Flow condition 都保持上一版的原始 `suffix_out`。
+- 因为参数树中不存在该新增参数，上一版 Stage-2 checkpoint 可以按原结构严格加载。
+- 设置 `msp_use_flow_pos_embed=True` 时，才创建 `msp_flow_pos_embed`，训练使用完整位置表，推理使用当前尺度 `start:end` 切片。
+
+使用约束：
+- 旧版 checkpoint 推理必须保持 `msp_use_flow_pos_embed=False`。
+- 后续设置为 `True` 后需要重新训练 Stage-2，不能在旧 checkpoint 推理时临时打开，因为旧权重中没有训练过该参数。
+
+本轮修改文件：
+- `openpi/src/openpi/models/pi0_config.py`
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/training/config.py`
+- `task.md`
+
+## 2026-09-01 LeRobot 时间戳容差
+
+需求与修改：
+- 在 `create_torch_dataset()` 构造普通 `LeRobotDataset` 时增加 `tolerance_s=0.041`。
+- fake dataset 和 Stage-1 action-only dataset 仍在 metadata/video dataset 创建前提前返回，不受该参数影响。
+- 其他 `delta_timestamps`、video backend 和 prompt transform 逻辑保持不变。
+
+本轮修改文件：
+- `openpi/src/openpi/training/data_loader.py`
+- `task.md`
+
+## 2026-09-01 Stage-1 KL 指标语义调整（用户修改）
+
+用户已将 `MspActionVAE.compute_loss_with_info()` 返回的指标从：
+- `kl_loss = mean(kl_weight * KL)`
+
+改为：
+- `kl_loss = mean(KL)`
+
+影响：
+- 只改变 TensorBoard/W&B 中 `kl_loss` 曲线的数值和含义。
+- `total_loss` 仍为 `recon_loss + kl_weight * KL`，训练梯度和优化目标没有变化。
+- 当前 `kl_loss` 表示未加权原始 KL，不能直接当作 KL 对总损失的实际贡献。
+
+用户修改文件：
+- `openpi/src/openpi/models/msp_vae.py`
+
+## 2026-09-01 TensorBoard 学习率曲线
+
+修改：
+- 在 `train_tb.py::train_step()` 的 `info` 中新增 `lr`。
+- 数值使用 `config.lr_schedule.create()(state.step)`，与当前 optimizer update 使用的 schedule 和 step 对齐。
+- 现有 TensorBoard 通用指标写入循环会自动生成 `lr` 曲线，不需要额外修改 writer 逻辑。
+
+本轮修改文件：
+- `openpi/scripts/train_tb.py`
+- `task.md`

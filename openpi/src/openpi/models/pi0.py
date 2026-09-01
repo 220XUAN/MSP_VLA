@@ -166,6 +166,15 @@ class Pi0(_model.BaseModel):
                 rngs=rngs,
             )
             self.msp_sos_token = nnx.Param(jnp.zeros((1, 1, action_expert_config.width), dtype=jnp.float32))
+            if config.msp_use_flow_pos_embed:
+                self.msp_flow_pos_embed = nnx.Param(
+                    jax.random.normal(
+                        rngs.params(),
+                        (1, sum(self.msp_scales), action_expert_config.width),
+                        dtype=jnp.float32,
+                    )
+                    * 0.02
+                )
         else:
             self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             if config.pi05:
@@ -187,6 +196,7 @@ class Pi0(_model.BaseModel):
         self.msp_flow_cfg_scale = config.msp_flow_cfg_scale
         self.msp_flow_adaptive_gamma = config.msp_flow_adaptive_gamma
         self.msp_flow_adaptive_c = config.msp_flow_adaptive_c
+        self.msp_use_flow_pos_embed = config.msp_use_flow_pos_embed
 
     @at.typecheck
     def embed_prefix(
@@ -309,6 +319,13 @@ class Pi0(_model.BaseModel):
             rope_positions=[None, rope_positions],
         )
         flow_conditions = suffix_out[:, -total_suffix_len:]
+        if self.msp_use_flow_pos_embed:
+            flow_positions = msp_scale_head.slice_scale_positions(
+                self.msp_flow_pos_embed.value,
+                self.msp_scales,
+                block_index=None,
+            ).astype(suffix_out.dtype)
+            flow_conditions = flow_conditions + flow_positions
         scale_starts, scale_ends = msp_scale_head.build_scale_segment_bounds(self.msp_scales)
         max_scale = float(self.msp_scales[-1])
         weighted_block_losses = []
@@ -351,7 +368,13 @@ class Pi0(_model.BaseModel):
 
         return weighted_total[:, None], metric_info
 
-    def _sample_msp_actions(self, rng: at.KeyArrayLike, observation: _model.Observation) -> _model.Actions:
+    def _sample_msp_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        noise: jnp.ndarray | None = None,
+    ) -> _model.Actions:
         assert self.msp_scales is not None
         observation = _model.preprocess_observation(None, observation, train=False)
         batch_size = observation.state.shape[0]
@@ -363,7 +386,23 @@ class Pi0(_model.BaseModel):
         scale_starts, _ = msp_scale_head.build_scale_segment_bounds(self.msp_scales)
 
         generated_blocks: list[jnp.ndarray] = []
-        scale_rngs = jax.random.split(rng, len(self.msp_scales))
+        if noise is None:
+            scale_rngs = jax.random.split(rng, len(self.msp_scales))
+            scale_noise = [
+                jax.random.normal(
+                    scale_rng,
+                    (batch_size, scale, latent_dim),
+                    dtype=jnp.float32,
+                )
+                for scale_rng, scale in zip(scale_rngs, self.msp_scales, strict=True)
+            ]
+        else:
+            scale_noise = msp_scale_head.split_scale_noise(
+                noise,
+                self.msp_scales,
+                batch_size=batch_size,
+                latent_dim=latent_dim,
+            )
         for block_idx in range(len(self.msp_scales)):
             current_scale = (self.msp_scales[block_idx],)
             block_start = int(scale_starts[block_idx])
@@ -403,13 +442,19 @@ class Pi0(_model.BaseModel):
                 rope_positions=[None, rope_positions],
             )
             flow_condition = suffix_out[:, -current_scale[0] :]
-            sample = jax.random.normal(
-                scale_rngs[block_idx],
-                (batch_size, current_scale[0], latent_dim),
-                dtype=jnp.float32,
+            if self.msp_use_flow_pos_embed:
+                flow_positions = msp_scale_head.slice_scale_positions(
+                    self.msp_flow_pos_embed.value,
+                    self.msp_scales,
+                    block_index=block_idx,
+                ).astype(suffix_out.dtype)
+                flow_condition = flow_condition + flow_positions
+            generated_latent = msp_flow_head.generate(
+                self.msp_flow_head,
+                flow_condition,
+                scale_noise[block_idx],
             )
-            generated_latent = msp_flow_head.generate(self.msp_flow_head, flow_condition, sample)
-            generated_blocks.append(generated_latent)
+            generated_blocks.append(jax.lax.stop_gradient(generated_latent))
 
         decoded_actions = self.msp_action_vae(generated_blocks[-1], train=False, method="get_action")
         return self._pad_msp_actions(decoded_actions)
@@ -511,8 +556,10 @@ class Pi0(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         if self.use_msp_action_head:
-            del num_steps, noise
-            return self._sample_msp_actions(rng, observation)
+            # In MSP mode, optional noise is concatenated latent-scale noise
+            # [B, sum(msp_scales), msp_latent_dim], not action-space noise.
+            del num_steps
+            return self._sample_msp_actions(rng, observation, noise=noise)
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.

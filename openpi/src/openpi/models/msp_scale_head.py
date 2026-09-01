@@ -66,6 +66,39 @@ def build_scale_segment_bounds(scales: tuple[int, ...]) -> tuple[np.ndarray, np.
     return starts, ends
 
 
+def split_scale_noise(
+    noise: jnp.ndarray,
+    scales: tuple[int, ...],
+    *,
+    batch_size: int,
+    latent_dim: int,
+) -> list[jnp.ndarray]:
+    """Validate and split inference noise into one latent block per MSP scale."""
+    expected_shape = (batch_size, sum(scales), latent_dim)
+    if noise.shape != expected_shape:
+        raise ValueError(f"Expected MSP noise shape {expected_shape}, got {noise.shape}")
+    starts, ends = build_scale_segment_bounds(scales)
+    return [noise[:, int(start) : int(end)] for start, end in zip(starts, ends, strict=True)]
+
+
+def slice_scale_positions(
+    position_embedding: jnp.ndarray,
+    scales: tuple[int, ...],
+    *,
+    block_index: int | None,
+) -> jnp.ndarray:
+    """Return the full training table or the current inference `start:end` slice."""
+    if position_embedding.shape[1] != sum(scales):
+        raise ValueError(
+            f"Expected position table length {sum(scales)} for scales {scales}, "
+            f"got {position_embedding.shape[1]}"
+        )
+    if block_index is None:
+        return position_embedding
+    starts, ends = build_scale_segment_bounds(scales)
+    return position_embedding[:, int(starts[block_index]) : int(ends[block_index])]
+
+
 def build_blockwise_visibility(scales: tuple[int, ...]) -> jnp.ndarray:
     """Build the exact MSP block-wise suffix visibility matrix.
 

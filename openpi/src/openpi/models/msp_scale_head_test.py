@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import pytest
 
 from openpi.models import msp_scale_head
 
@@ -142,3 +143,45 @@ def test_teacher_forcing_and_inference_follow_msp_two_step_resize():
             dtype=jnp.float32,
         )
         assert jnp.allclose(inference_input, expected_input)
+
+
+def test_split_scale_noise_returns_exact_scale_blocks():
+    scales = (1, 2, 4)
+    noise = jnp.arange(2 * sum(scales) * 3, dtype=jnp.float32).reshape(2, sum(scales), 3)
+
+    blocks = msp_scale_head.split_scale_noise(noise, scales, batch_size=2, latent_dim=3)
+
+    assert [block.shape for block in blocks] == [(2, 1, 3), (2, 2, 3), (2, 4, 3)]
+    assert jnp.array_equal(blocks[0], noise[:, :1])
+    assert jnp.array_equal(blocks[1], noise[:, 1:3])
+    assert jnp.array_equal(blocks[2], noise[:, 3:7])
+
+
+def test_split_scale_noise_rejects_action_space_shape():
+    with pytest.raises(ValueError, match="Expected MSP noise shape"):
+        msp_scale_head.split_scale_noise(
+            jnp.zeros((2, 32, 14), dtype=jnp.float32),
+            (1, 2, 4, 8),
+            batch_size=2,
+            latent_dim=16,
+        )
+
+
+def test_slice_scale_positions_matches_msp_training_and_inference_rules():
+    scales = (1, 2, 4, 8)
+    positions = jnp.arange(sum(scales) * 3, dtype=jnp.float32).reshape(1, sum(scales), 3)
+    starts, ends = msp_scale_head.build_scale_segment_bounds(scales)
+
+    training_positions = msp_scale_head.slice_scale_positions(positions, scales, block_index=None)
+    assert jnp.array_equal(training_positions, positions)
+
+    for block_index in range(len(scales)):
+        inference_positions = msp_scale_head.slice_scale_positions(
+            positions,
+            scales,
+            block_index=block_index,
+        )
+        assert jnp.array_equal(
+            inference_positions,
+            positions[:, int(starts[block_index]) : int(ends[block_index])],
+        )

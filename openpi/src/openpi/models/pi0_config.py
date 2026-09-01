@@ -61,6 +61,7 @@ class Pi0Config(_model.BaseModelConfig):
     msp_flow_cfg_scale: float = 2.0
     msp_flow_adaptive_gamma: float = 0.5
     msp_flow_adaptive_c: float = 1e-3
+    msp_use_flow_pos_embed: bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:

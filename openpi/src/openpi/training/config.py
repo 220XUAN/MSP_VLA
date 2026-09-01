@@ -715,6 +715,7 @@ _CONFIGS = [
             use_msp_action_head=True,
             action_horizon=32,
             msp_action_dim=14,
+            msp_use_flow_pos_embed=False,
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="RoboDojo_sim_arx-x5_v30",
