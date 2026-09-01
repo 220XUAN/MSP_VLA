@@ -140,7 +140,7 @@ def init_train_state(
     if config.msp_vae_weight_path is not None:
         logger.info("Loading MSP stage-1 weights from %s", config.msp_vae_weight_path)
         stage1_params = _weight_loaders.merge_msp_vae_params(full_shape, config.msp_vae_weight_path)
-        partial_params = _merge_partial_params(base_params, stage1_params)
+        partial_params = _merge_partial_params(stage1_params, base_params)
         logger.info("MSP stage-1 weight load succeeded.")
     else:
         partial_params = base_params

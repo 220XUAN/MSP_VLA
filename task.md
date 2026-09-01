@@ -1861,6 +1861,1220 @@ flow_loss = sum(loss)
 - `openpi/src/openpi/models/msp_scale_head_test.py`
 - `task.md`
 
+## 2026-08-31 多任务 stage2 推理统一倒臂姿态的诊断
+
+现象：
+- 多任务 stage2 训练后，推理时无论哪个任务，机械臂都会以近似相同姿态倒下
+
+当前代码下的高概率原因，按优先级排序：
+
+1. 部署侧如果没有提供 `instruction`，多任务条件会直接退化
+- 文件：`model.py`
+- `encode_obs()` 当前只从 `observation.get("instruction")` 取 prompt
+- 如果环境侧没有这个字段，部署时传给 openpi 的 `prompt` 就是 `None`
+- 而训练配置 `pi05_msp_stage2_aloha_arx-x5_seed_0` 是 `prompt_from_task=True`
+- 这意味着训练时模型依赖任务文本区分多任务，但推理时如果没有 `instruction`，模型就只能靠视觉/状态，容易退化到统一动作
+
+2. 当前 stage2 目标仍然是 latent MSE，不是 MSP 原版的完整 FlowAR 目标
+- 文件：`openpi/src/openpi/models/pi0.py`
+- 当前 `_compute_msp_loss_with_info()` 监督的是：
+  - `pred_latents` 对 `target_latents` 的平方误差
+- 即：
+  - 第 294-316 行这一段本质是多尺度 latent 回归
+- 这和 MSP 原版的 `FlowAR + flow loss` 仍有差别
+- 在多任务下，这种目标更容易学成“条件无关的平均 latent”，再经 stage1 decoder 解码成一个固定坏姿态
+
+3. 训练-推理存在 teacher forcing / exposure bias
+- 训练：
+  - `build_teacher_forced_inputs()` 用 GT finer/coarser latent 构造下一尺度输入
+- 推理：
+  - `build_current_scale_inputs()` 用模型上一尺度预测结果构造下一尺度输入
+- 所以只要第一二个尺度预测偏掉，误差就会逐尺度放大，最后 finest latent 会塌到相似区域
+- 这类问题在“所有任务都倒向同一姿态”时非常典型
+
+4. 当前 MSP 头里 `adarms_cond` 是 0，不是原 pi0.5 flow head 那套时间条件
+- 文件：`openpi/src/openpi/models/pi0.py`
+- `_embed_msp_suffix()` 里：
+  - `adarms_cond = jnp.zeros(...)`
+- 这本身不一定是 bug，因为 stage2 已经不是 flow matching
+- 但它说明现在动作头条件化能力比原 pi0.5 flow head 更弱，更多依赖 prefix 的视觉/语言 token
+
+5. 如果多任务环境的初始观测相近，而文本条件又缺失，统一倒臂会更明显
+- 这时 prefix 基本相同
+- 自回归 MSP 头就很容易输出近似同一个 latent 序列
+
+建议先做的排查，不先改结构：
+
+1. 先确认部署时每个任务的 `obs["instruction"]` 是否真的非空
+- 这是第一优先级
+- 如果这里是空，当前多任务失败基本可以解释通
+
+2. 打印推理时不同任务的：
+- tokenized prompt 是否不同
+- `generated_blocks[-1]` 的均值/方差是否几乎一样
+- `decoded_actions[0, 0]` 是否在任务间几乎一致
+
+3. 对比单任务 stage2 是否也会倒臂
+- 如果单任务正常，多任务异常，优先怀疑任务条件没送进去或条件利用太弱
+- 如果单任务也异常，优先怀疑 stage2 latent 头本身塌缩
+
+当前判断：
+- 不是单一“代码报错型”问题
+- 更像“任务条件缺失 + latent 回归头塌缩 + teacher forcing 到自回归的分布偏移”叠加出来的行为
+
+## 2026-08-31 动作从模型预测到仿真执行的链路审查
+
+你这次重点怀疑的是：
+- `norm_state / norm_action` 是否有问题
+- pi0.5 原始 32 维动作头和当前 MSP 14 维动作头的维度适配是否错位
+- 当前实现里 “先预测 14 维，再 pad 到 32 维” 会不会影响反归一化和执行
+
+结论先说：
+- 仅从当前代码链路看，`MSP 输出后 pad 到 32 再 Unnormalize` 这件事本身不是主要问题
+- 这条链路在数值上是自洽的
+- 真正更可疑的是：
+  1. stage2 的 latent 头本身塌缩
+  2. stage2 用的是 MSP 14 维动作统计，而不是原始 pi0.5 32 维 flow 头那套训练目标
+  3. 如果部署/训练用的 norm stats 资产不一致，也会让 14 维输出被错误反归一化
+
+### 当前推理链路的真实顺序
+
+1. `model.py`
+- `encode_obs()` 把环境观测打包成：
+  - `state`
+  - `images`
+  - `prompt`
+- 然后 `self.policy.infer(single_observation)`
+
+2. `policy_config.create_trained_policy()`
+- 输入变换顺序：
+  - `repack_transforms.inputs`
+  - `InjectDefaultPrompt`
+  - `data_transforms.inputs`
+  - `Normalize`
+  - `model_transforms.inputs`
+- 输出变换顺序：
+  - `model_transforms.outputs`
+  - `Unnormalize`
+  - `data_transforms.outputs`
+  - `repack_transforms.outputs`
+
+3. Aloha 输入侧
+- `LeRobotAlohaDataConfig.create()` 里接的是：
+  - `AlohaInputs`
+  - 可选 `DeltaActions`
+- `AlohaInputs` 会先把 Aloha 原始状态/动作变换到 pi 训练空间
+- 这里训练和推理都会生效
+
+4. 归一化
+- `Normalize` 发生在 `AlohaInputs` 之后、`PadToDims` 之前
+- 也就是说：
+  - 先在真实 14 维 Aloha/pi 动作空间上做归一化
+  - 再做模型维度适配
+
+5. MSP 配置下的维度适配
+- `ModelTransformFactory` 对 `use_msp_action_head=True` 时，用的是：
+  - `PadToDims(state_dim=32, action_dim=14)`
+- 这意味着：
+  - `state` pad 到 32 维
+  - `actions` 保持 14 维，不 pad 到 32
+- 所以 stage2 训练时，送进 `msp_action_vae` 的动作本来就是 14 维
+
+6. MSP 模型输出
+- `pi0.py::_sample_msp_actions()`
+  - `msp_action_vae(..., method="get_action")` 先解码出 14 维动作
+  - 然后 `_pad_msp_actions()` 才把它 pad 到 32 维
+
+7. 反归一化
+- `Unnormalize` 在输出侧先于 `AlohaOutputs`
+- 它的实现对超出统计维度的 pad 部分采用：
+  - `mean=0`
+  - `std=1`
+- 所以：
+  - 前 14 维按真实动作统计反归一化
+  - 后面补出来的 18 维保持原值不变，通常仍是 0
+- 这一步本身没有把前 14 维搞乱
+
+8. Aloha 输出侧
+- `AlohaOutputs` 直接做：
+  - `actions = data["actions"][..., :14]`
+  - 然后 `_encode_actions(...)`
+- 也就是：
+  - 先截回前 14 维
+  - 再做 Aloha 执行空间的关节符号/夹爪范围映射
+
+9. XPolicyLab 执行侧
+- `model.py::get_action_batch()`
+  - `policy.infer()` 返回的已经是 14 维 Aloha 动作
+  - 然后再喂给 `unpack_robot_state(..., source_type="obs")`
+- `unpack_robot_state()` 只是把 14 维向量拆成左右臂字典，不做数值缩放
+
+### 因此，关于你问的 “原版 pi0.5 小任务微调 14 维时有没有 pad”
+
+原版 pi0.5 常规做法是：
+- 输入侧：
+  - 先在真实机器人动作维度上做数据变换和归一化
+  - 再 pad 到模型动作维度
+- 输出侧：
+  - 先反归一化
+  - 再截回真实机器人动作维度
+
+你现在的 MSP 版本虽然不是完全一样的 32 维 flow 头，但在“norm 和 pad 的顺序”这件事上没有明显反了。
+
+### 这次审查后的关键判断
+
+1. `MSP 输出后 pad 到 32 再 Unnormalize`
+- 这不会污染前 14 维
+- 因为 `Unnormalize` 对新增 pad 维度用的是单位统计
+
+2. 真正和原版 pi0.5 不同的是
+- 原版 pi0.5 动作头本体就是 32 维 flow head
+- 现在 MSP 模式下，动作建模主体已经换成了 14 维 VAE latent -> 14 维 decoder
+- 32 维只剩下状态 token 对齐和接口兼容意义，不再是动作语义本体
+
+3. 所以“统一倒臂”更像是动作头学坏了，而不是 pad/norm 顺序把动作毁了
+- 尤其是当前 stage2 还是 latent MSE，不是原版 MSP FlowAR
+- 多任务下更容易塌到平均 latent，再解码成固定姿态
+
+4. 仍需单独核实的一点
+- 当前 deploy 加载的 `norm_stats.json` 是否确实来自你这次 stage2 checkpoint 的 `assets/<repo_id>/`
+- 如果误用了别的 checkpoint 的 norm stats，14 维动作会被系统性错误反归一化，这也会导致动作整体塌坏
+
+下一步最值得做的不是继续猜，而是直接打印：
+- `policy.infer()` 刚返回、尚未 `unpack_robot_state()` 前的 14 维 action
+- `Unnormalize` 前后的 action
+- `AlohaOutputs` 截断前后的 action
+- 这样可以立刻判断问题是在 MSP 动作头、反归一化，还是 Aloha 输出映射
+
+## 2026-08-31 参考 MINT 后的结构对比结论
+
+参考代码：
+- `/home/xuan/PycharmProjects/VLA/MSP_VLA/XPolicyLab/policy/Pi_05/MINT/policy/lerobot_policy_mint`
+
+### MINT 这套方法的关键结构
+
+1. 第一阶段不是连续 latent VAE，而是 `MultiScaleVQVAE`
+- 文件：
+  - `.../modeling_mint.py`
+  - `.../mint_utils.py`
+- 训练时先把动作编码成多尺度离散 code：
+  - `idxBls_List = self.multi_scale_vqvae.inp_to_idxBl(actions)`
+
+2. 第二阶段监督目标不是 latent MSE，而是离散 token 的交叉熵
+- 文件：`modeling_mint.py:761-765`
+- 直接做：
+  - `F.cross_entropy(vq_logits.transpose(1, 2), gt_idxBls, reduction="none")`
+- 这点非常关键
+- 因为它不是让模型去回归“平均 latent”，而是让模型在 codebook 上做分类
+- 在多任务下，这种目标通常比连续 latent 回归更不容易塌到统一姿态
+
+3. 下一尺度输入不是简单 resize 上一尺度输出
+- 训练时：
+  - `quantizer.idxBl_to_next_scale_input(idxBls_List)`
+- 推理时：
+  - `quantizer.get_next_autoregressive_input(...)`
+- 也就是说：
+  - coarse -> fine 的过渡不是“上一尺度 token / latent 线性插值一下”
+  - 而是通过 quantizer 内部的多尺度残差累计逻辑构造
+
+4. 推理是标准的 prefix 一次编码 + suffix 分尺度 KV-cache 自回归
+- 文件：`modeling_mint.py:934-1014`
+- 先跑一次 prefix 拿 `past_key_values`
+- 后面每个尺度只喂当前尺度 token
+- 当前尺度可以看全部 prefix 和历史尺度
+- 然后把当前尺度采样到的 code 更新到 `f_hat`
+- 最后用 VQ-VAE decoder 解码出动作
+
+### 它和我们当前 `pi0.5 + MSP` 的关键差异
+
+1. 我们现在第二阶段还是连续 latent 回归
+- 文件：`openpi/src/openpi/models/pi0.py`
+- 当前 loss 是：
+  - `pred_latents` vs `target_latents` 的 MSE
+- MINT 是离散 code CE
+- 这会直接影响多任务稳定性
+
+2. 我们现在的 coarse -> fine 输入构造更弱
+- 当前训练：
+  - `build_teacher_forced_inputs()`
+- 当前推理：
+  - `build_current_scale_inputs()`
+- 本质都是“上一尺度结果 resize 后作为下一尺度输入”
+- MINT 这里是 quantizer 驱动的累计重建状态，不只是 resize
+
+3. 我们现在最终 finest latent 直接送 stage1 decoder
+- MINT 是把每一尺度采样结果逐步累计进 `f_hat`
+- 最终 decode 的不是“最后一段 token 本身”
+- 而是“累计后的完整多尺度量化表示”
+
+4. 我们现在虽然也有 block-wise mask 和按尺度推理
+- 但核心生成目标仍更像：
+  - prefix-conditioned multi-scale latent regressor
+- MINT 更像：
+  - prefix-conditioned multi-scale discrete autoregressive generator
+
+### 对你当前“所有任务统一倒臂”的启发
+
+这份 MINT 参考很有价值，因为它说明：
+
+1. 问题未必在 `norm/pad`
+- 更可能在第二阶段目标过弱
+
+2. 当前 `latent MSE + resize传递` 这条链路更容易塌缩
+- 尤其是多任务
+- 因为模型可以通过输出“平均 latent”获得一个不算太差的 MSE
+
+3. MINT 这种离散 code CE 目标天然更抗“平均化”
+- 分类任务里输出错误类别会被直接惩罚
+- 不像连续回归那样容易往均值收缩
+
+### 对我们当前实现的直接建议
+
+不直接抄成 VQ-VAE，但可以借 MINT 的两个关键思想：
+
+1. 第二阶段不要只做 finest latent 的连续 MSE
+- 至少要增强为更强监督
+- 例如：
+  - 每尺度独立监督
+  - coarse->fine residual supervision
+  - 或者直接改成离散 latent/code 预测
+
+2. 下一尺度输入不要只靠 resize 上一尺度预测
+- 更应接近“累计重建状态”
+- 也就是：
+  - 当前尺度预测出来后，不只是把这一段 token 传下去
+  - 而是要构造一个“到目前为止的多尺度重建表示”，再供下一尺度条件化
+
+### 当前最重要的判断
+
+如果你要找一个“和你现在做的最像、又能解释为什么你这版容易倒臂”的参考，
+那 MINT 给出的核心答案是：
+
+- 不是多尺度自回归这个大方向错了
+- 是你当前第二阶段的“连续 latent MSE + 简单 resize 传递”太弱
+- 它比 MINT 的“离散 code CE + quantizer累计状态传递”更容易塌缩成统一动作
+
+## 2026-08-31 新判断：重点不是怀疑 MSP，而是学习 MINT 如何改 pi0.5 动作头
+
+你这次纠正得对：
+- `MSP` 这个方向本身没有问题
+- 即使动作头里不带 flow，只保留“尺度 Transformer + decoder”，也可以正常工作
+- 所以当前问题更应看成“从 pi0.5 迁到多尺度头时，动作头适配没有对齐好”
+
+### 从 MINT 看，pi0.5 动作头到底改了什么
+
+MINT 不是简单“在原动作头外面包一层多尺度逻辑”，它改的是动作头的输入、输出、训练目标、推理路径四件事。
+
+1. 保留前缀 VLM，不动 prefix 编码
+- 图像和语言 prefix 还是正常进 PaliGemma
+- 这一点和我们当前思路一致
+
+2. 原 pi0.5 的 suffix 输入被彻底替换了
+- 原始 pi0.5：
+  - suffix 输入是 `noisy_actions -> action_in_proj`
+  - 再配合 timestep / adaRMS 做 flow matching
+- MINT：
+  - suffix 输入不再是连续动作
+  - 而是 `多尺度 code embedding + level embedding + sos`
+- 也就是说，动作 expert Gemma 还在，但它吃的 token 语义已经换了
+
+3. 原 pi0.5 的输出头也被彻底替换了
+- 原始 pi0.5：
+  - `suffix_out -> action_out_proj`
+  - 输出连续动作/速度场
+- MINT：
+  - `suffix_out -> vq_code_out_proj`
+  - 输出每个尺度位置上的 codebook logits
+- 所以 Gemma expert 不再回归动作值，而是在做多尺度 token 预测
+
+4. 原 pi0.5 的训练目标被替换成多尺度自回归目标
+- 原始 pi0.5：
+  - flow matching / diffusion-style continuous regression
+- MINT：
+  - 多尺度 token CE
+- 关键点不是“多尺度”三个字，而是：
+  - 动作 expert 被改造成了一个真正的 AR decoder，而不再是 flow regressor
+
+5. 推理路径也不是原 pi0.5 那套迭代 denoise
+- 原始 pi0.5：
+  - 多步 ODE / flow rollout
+- MINT：
+  - prefix 一次编码
+  - suffix 逐尺度 KV-cache 自回归
+  - 最后把最细尺度累计状态送 decoder 还原动作
+
+### 这对我们当前 `pi0.5 + MSP` 的直接启发
+
+我们现在虽然也做了“多尺度 suffix + block mask + 分尺度推理”，
+但本质上还没有把 `pi0.5 action expert` 完整改造成“多尺度 AR 动作头”。
+
+当前更像是：
+- 用 Gemma expert 回归多尺度 latent
+
+而 MINT 这种改法更像是：
+- 用 Gemma expert 作为真正的多尺度自回归解码器
+
+### 因此，后面改造动作头时应按这个映射来审查
+
+需要逐项核对这 4 件事是否都改对了：
+
+1. suffix token 语义有没有彻底替换
+- 不能保留原 flow-head 的输入假设
+
+2. action expert 的输出头有没有换成“尺度预测头”
+- 不能还沿着原动作回归头思路改一半
+
+3. 训练目标有没有和新头严格匹配
+- 新头如果是 AR 头，loss 也要是 AR 对应的监督
+
+4. 推理路径有没有和训练时的 token/state 传递一致
+- 不能训练时一套、推理时另一套
+
+### 当前下一步
+
+下一步不先改代码，先专门对照：
+- 原始 `pi0.5` 动作头
+- `MINT` 的多尺度动作头
+- 我们当前 `pi0.py` 的 MSP 动作头
+
+把“输入 token 语义 / 输出头 / loss / 推理缓存路径”四栏做成一张差异表，
+这样才能精确知道现在到底少改了哪一块。
+
+## 2026-08-31 关于“直接拿 MINT 动作头来用”的判断
+
+结论：
+- 可以直接借用 `MINT` 动作头的整体骨架
+- 不能把 `MINT` 头原样搬过来只改输入输出维度
+
+原因不是简单的“离散/连续张量不同”，而是 `MINT` 头的定义里本身就包含了离散量化器语义：
+
+1. `MINT` 的输入不是普通 latent
+- 它输入的是：
+  - `SOS`
+  - `level embedding`
+  - `quantizer.idxBl_to_next_scale_input(...)` 产生的下一尺度条件
+
+2. `MINT` 的输出也不是普通 latent
+- 它输出的是 codebook logits
+- 然后通过采样得到离散 index
+
+3. `MINT` 的尺度间状态传递依赖 quantizer
+- 推理时核心不是“预测当前尺度 -> resize -> 下一尺度”
+- 而是：
+  - `quantizer.get_next_autoregressive_input(...)`
+  - 维护累计重建状态 `f_hat`
+
+4. `MINT` 的最终 decoder 输入也不是最后一层 token
+- 而是累计后的量化重建表示
+
+因此，真正可复用的是：
+- `prefix 保留、suffix 改成多尺度 AR` 这个总体结构
+- `SOS + level embedding + blockwise mask + prefix一次编码 + scale-wise kv-cache` 这套推理框架
+- `动作 expert 从 flow regressor 改成 AR predictor` 这个改造方向
+
+不能直接照搬的是：
+- `vq_code_in_proj / vq_code_out_proj`
+- `idxBl_to_next_scale_input`
+- `get_next_autoregressive_input`
+- `f_hat + codebook + CE loss`
+
+如果迁到连续 latent MSP，应该做的是：
+
+1. 保留 MINT 的 AR 骨架
+- prefix 一次编码
+- suffix 分尺度生成
+- 每尺度有独立 level/scale embedding
+- KV-cache 按尺度递推
+
+2. 把离散 code 预测替换为连续 latent 预测
+- `vq_code_out_proj` -> `latent_out_proj`
+
+3. 把 quantizer 驱动的状态传递替换为连续 latent 的累计状态传递
+- 这一步不能只写成“简单 resize”
+- 需要设计成更接近“累计重建状态”的连续版本
+
+4. decoder 仍走第一阶段 latent decoder
+- 但输入最好是“累计后的 finest 表示”
+- 不只是最后一次预测块的裸输出
+
+## 2026-08-31 MINT 的尺度构造与 coarse-to-fine 状态传递
+
+这一步只回答两个问题：
+
+1. `MINT` 的多尺度是怎么构造的
+2. `MINT` 的尺度为什么是从粗到细，以及尺度间状态怎么传
+
+### 1. MINT 的多尺度怎么构造
+
+核心配置是：
+- `configuration_mint.py`
+- `patch_nums`
+
+它表示一组严格递增的尺度长度，例如概念上可以是：
+- `(1, 2, 4, 8)`
+- 或 `(2, 4, 8, 16)`
+
+最后一个尺度必须等于 VQ-VAE latent 的最长时间长度。
+
+在 quantizer 里，多尺度不是对原动作直接切块，而是对 VQ-VAE encoder 输出的 latent feature `f_BCH` 做多尺度残差量化：
+
+1. 先得到最高分辨率 latent feature：
+- `f_BCH`
+- shape 类似 `(B, C, H)`
+- 其中 `H = patch_nums[-1]`
+
+2. 从最粗尺度开始，依次对当前残差 `f_rest` 做下采样：
+- `F.interpolate(f_rest, size=pn, mode=self.downsample_mode)`
+
+3. 在当前尺度上，为每个位置找到最近的 codebook embedding：
+- 得到 `idx_BH`
+
+4. 再把这个尺度的 embedding 上采样回最大长度 `H`
+- 然后经过 `quant_resi`
+- 得到这个尺度对应的重建分量 `h_BCH`
+
+5. 累加到总重建：
+- `f_hat = f_hat + h_BCH`
+
+6. 同时更新剩余残差：
+- `f_rest = f_rest - h_BCH`
+
+所以 MINT 的多尺度本质上是：
+- 对同一个最高分辨率 latent feature
+- 做一串“从粗到细的残差量化分解”
+
+不是简单把序列 resize 出几个版本完事。
+
+### 2. 为什么是从粗到细
+
+因为它每一层预测的不是完整最终表示，而是：
+- 当前分辨率下，对“还没解释掉的残差”的一个补充
+
+粗尺度先负责全局轮廓：
+- 低分辨率
+- 覆盖整段动作的大致趋势
+
+细尺度再负责补细节：
+- 更高分辨率
+- 修正 coarse scale 没表达完的局部变化
+
+这个逻辑直接体现在：
+- `for si, pn in enumerate(self.patch_nums): # from small to large`
+
+### 3. 训练时的尺度间状态传递
+
+训练时用的是：
+- `idxBl_to_next_scale_input(gt_ms_idx_Bl)`
+
+它做的事不是“把上一尺度 token resize 一下”，而是：
+
+1. 初始化累计状态：
+- `f_hat = zeros(B, C, H_max)`
+
+2. 对第 `si` 个 GT 尺度 token：
+- 查 codebook embedding
+- 上采样到最高尺度 `H_max`
+- 过 `quant_resi`
+- 累加进 `f_hat`
+
+3. 把当前累计状态 `f_hat` 再下采样到下一尺度长度 `patch_nums[si+1]`
+- 这个结果就是下一尺度 Transformer 的输入条件
+
+4. 把所有“下一尺度输入”拼起来：
+- 形成训练时 teacher-forcing 的 suffix 输入
+
+所以训练时的 next-scale input 语义是：
+- “截至当前尺度为止，已经累计重建出来的 latent 状态”
+
+不是：
+- “单独上一尺度的输出”
+
+### 4. 推理时的尺度间状态传递
+
+推理时用的是：
+- `get_next_autoregressive_input(si, SN, f_hat, h_BCH)`
+
+逻辑和训练时完全同源：
+
+1. 当前尺度采样出 index
+2. index -> embedding -> 当前尺度重建分量 `h_BCH`
+3. 若不是最细尺度：
+- 先上采样到最高尺度
+- 过 `quant_resi`
+- 累加进 `f_hat`
+4. 再把累计后的 `f_hat` 下采样到下一尺度长度
+5. 这个“下采样后的累计状态”作为下一尺度的输入 token map
+
+所以推理时传给下一尺度的也不是“上一尺度预测值本身”，而是：
+- 当前为止的累计重建状态
+
+### 5. 这套机制最关键的抽象
+
+MINT 跨尺度传递的不是 token，而是一个持续更新的隐藏状态：
+- `f_hat`
+
+每一层都在做：
+- 当前尺度预测 -> 转成当前尺度重建分量 -> 更新全局累计状态 `f_hat`
+
+然后下一层拿到的是：
+- `downsample(f_hat)`
+
+这比“上一尺度结果直接 resize 给下一层”强很多，因为：
+
+1. 它保留了所有已生成尺度的累计信息
+2. 它和最终 decoder 输入语义一致
+3. 训练和推理完全对齐
+
+### 6. 对替换成 MSP 连续 latent 的直接启发
+
+如果我们要把这套逻辑替换成 MSP 连续 latent 版，最该保留的不是 VQ 离散化本身，而是这个抽象：
+
+- 维护一个 coarse-to-fine 的累计隐藏状态
+- 下一尺度条件输入 = 当前累计状态的尺度化版本
+
+也就是说，MSP 连续 latent 版更合理的 next-scale input 应该是：
+- `running_latent_state`
+- 而不是简单的 `resize(prev_scale_latent)`
+
+这是后面替换 `build_teacher_forced_inputs()` 和 `build_current_scale_inputs()` 时最重要的参考点。
+
+## 2026-08-31 MINT 动作头骨架 + MSP 连续尺度语义的最终迁移方案
+
+这里更正上一节最后一部分的推断：
+- MINT 的确维护累计量化重建状态 `f_hat`
+- 但原版 MSP `MSP/algos/flow/flow_ar.py` 没有照搬这套累计状态
+- MSP 的尺度间传递明确是：
+  - 当前/上一尺度 latent 上采样到最大尺度
+  - 再下采样到下一尺度
+  - 下一尺度直接使用这个 resize 结果
+- 因此 pi0.5 + MSP 不应自行引入连续版 `f_hat`；尺度构造和传递必须以 MSP 为准
+
+这次迁移分工如下：
+
+1. 从 MINT 复用 pi0.5 动作头适配骨架
+- VLM prefix 保持原样
+- suffix 使用 learned SOS、scale embedding 和连续 latent projection
+- 训练时一次输入完整多尺度 suffix
+- suffix 使用尺度块 attention mask
+- 推理时 VLM prefix 只运行一次
+- action expert 按尺度增量更新 KV cache
+
+2. 从 MSP 保留连续多尺度语义
+- 最细 VAE latent 通过线性插值得到各尺度 target
+- teacher forcing 的下一尺度输入来自上一 GT 尺度：先上采样到最大尺度，再下采样到下一尺度
+- 推理的下一尺度输入来自上一预测尺度，使用完全相同的两次 resize
+- 最终只把最细尺度连续 latent 送入 Stage-1 VAE decoder
+- loss 继续按 `scale / max_scale` 加权
+
+3. 不迁移 MINT 的离散部分
+- 不使用 codebook/index
+- 不使用 `idxBl_to_next_scale_input`
+- 不使用 `get_next_autoregressive_input` 的 `f_hat` 累计逻辑
+- 不使用 code logits、采样和交叉熵
+
+对当前实现的关键审查结果：
+- mask、block-local RoPE、三组 learned positional embeddings、prefix-once KV cache 已经存在
+- MSP 的 resize 尺度传递也已经存在，方向正确
+- 发现一个明确的训练/推理不一致：
+  - 训练 `_embed_msp_suffix(..., self.msp_scales)` 会得到正确的尺度 ID `0,1,2,...`
+  - 推理传入单元素 `current_scale=(scale,)`，`build_scale_ids(current_scale)` 每轮都会返回 0
+  - 结果是所有推理尺度都错误地使用最粗尺度 embedding
+  - MINT 推理使用 `level_embs(si)`，所以推理必须显式使用当前 `block_index`
+
+分步修改顺序：
+1. 修复推理 scale ID，并增加 MINT 式 learned SOS
+2. 用测试锁定 MSP 的 target 构造、teacher forcing 和推理 resize 传递完全同源
+3. 核对训练全序列与推理逐尺度 cache 的 mask/位置/尺度 embedding 一致性
+4. 增加最小前向验证和逐尺度输出统计，重点排查多任务推理塌缩
+
+本轮计划修改文件：
+- `openpi/src/openpi/models/msp_scale_head.py`
+- `openpi/src/openpi/models/msp_scale_head_test.py`
+- `openpi/src/openpi/models/pi0.py`
+- `task.md`
+
+第一步实际修改：
+1. 修复 scale embedding 的训练/推理不一致
+- `build_scale_ids(..., block_index=None)`：训练返回完整的绝对尺度 ID
+- `build_scale_ids((current_scale,), block_index=i)`：推理返回当前绝对尺度 ID `i`
+- `_embed_msp_suffix()` 推理不再把所有尺度误当成第 0 层
+
+2. 增加 MINT 式 learned SOS
+- 新参数：`msp_sos_token`
+- 训练完整 suffix 的第一尺度使用 SOS
+- 推理第 0 个尺度使用同一个 SOS
+- 后续尺度仍使用 MSP 的上一尺度 resize latent 经 `msp_latent_in_proj` 后的 token
+- 参数名带 `msp`，加载原始 pi0.5 权重时由现有 `missing_regex=".*lora.*|.*msp.*"` 保持随机初始化
+
+3. 显式 detach Stage-1 latent
+- VAE `get_sample` 后增加 `jax.lax.stop_gradient`
+- 对齐 MSP 原版 `act.detach()`
+- Stage-2 的 target 和 teacher-forcing 输入不向 Stage-1 VAE 反向传播
+
+4. 新增回归测试
+- 训练完整尺度 ID 与推理绝对尺度 ID 一致
+- 各尺度 target 是最细 latent 的线性 resize
+- 训练 teacher forcing 与推理 next-scale input 都遵循 MSP 的：
+  - 上一尺度 -> 最大尺度 -> 下一尺度
+
+兼容性说明：
+- 从原始 pi0.5 + Stage-1 VAE 开始训练 Stage-2：兼容，`msp_sos_token` 随机初始化
+- 已经训练好的旧版 Stage-2 完整 checkpoint：缺少 `msp_sos_token`，不能当作新结构的完整 checkpoint 直接恢复；需要重新训练或单独提供旧 checkpoint 迁移逻辑
+
+本轮验证：
+- `py_compile` 通过：
+  - `openpi/src/openpi/models/msp_scale_head.py`
+  - `openpi/src/openpi/models/msp_scale_head_test.py`
+  - `openpi/src/openpi/models/pi0.py`
+- `git diff --check` 通过
+- 当前本地 `openpi/.venv` 没有安装 `jax` 和 `pytest`，所以新增 JAX 单元测试未在本机执行
+- 没有为此临时安装或改变训练环境；需要在服务器实际 openpi/JAX 环境运行：
+  - `pytest openpi/src/openpi/models/msp_scale_head_test.py -q`
+
+当前迁移完成度：
+- MINT 提供的 pi0.5 suffix 改造骨架已经对齐：SOS、level embedding、block AR、prefix-once、scale-wise KV cache
+- MSP 提供的连续 latent 语义已经保留：多尺度 target、两次 resize 传递、连续回归、最细 latent VAE decode
+- VLM prefix 和原始 pi0.5 权重加载路径未修改
+- 本轮没有引入 MINT 的 codebook、离散采样、累计 `f_hat` 或 CE loss
+
+## 2026-08-31 再审查：当前单 Gemma action expert 与 MSP/MINT 的结构语义错配
+
+用户指出的问题成立：当前代码把 MSP 原版 encoder/decoder 的 learned positional embeddings 同时加到单个 Gemma suffix 输入上，属于硬搬参数、没有搬对应计算阶段。
+
+### 严重问题 1：三组 learned positional embeddings 的落点不成立
+
+当前 `pi0.py`：
+- `msp_encoder_pos_embed` 加在 Gemma action expert 输入前
+- `msp_decoder_pos_embed` 也加在同一处
+- `msp_diffusion_pos_embed` 加在 Gemma 输出后、continuous latent projection 前
+
+MSP 原版真实结构：
+1. `encoder_pos_embed_learned`
+- 加在独立 MAE encoder 前
+- 后面经过 `encoder_blocks`
+
+2. `decoder_pos_embed_learned`
+- encoder 输出先经过 `decoder_embed`
+- 再加 decoder position
+- 后面经过另一套独立 `decoder_blocks`
+
+3. `diffusion_pos_embed_learned`
+- 加在 decoder blocks 输出后
+- 作为独立 flow head 的条件输入
+
+当前 pi0.5 + MSP 只有一套 Gemma action expert：
+- 没有 MSP encoder/decoder 两套 Transformer
+- 没有 `decoder_embed + decoder_blocks`
+- 没有 diffusion/flow head
+
+所以不能把三张位置表按名字全部保留。尤其：
+- `encoder_pos + decoder_pos` 在同一输入处相加没有结构依据
+- `diffusion_pos` 在没有 diffusion head 时也没有对应语义
+
+推荐修改：
+- 删除 `msp_encoder_pos_embed`
+- 删除 `msp_decoder_pos_embed`
+- 删除 `msp_diffusion_pos_embed`
+- 删除 `_msp_pos_slice()` 和训练/推理中的对应加法
+- suffix token 保持 MINT 已验证的形式：
+  - 第 0 尺度：`SOS + scale_embed`
+  - 后续尺度：`latent_in_proj(resized_previous_latent) + scale_embed`
+- 时间位置只交给 Gemma suffix 的 block-local RoPE
+
+如果以后确实要保留 learned temporal position，最多只能为“这一套 Gemma stack”重新定义一张统一位置表；但这将是新设计，不是 MINT 或 MSP 的直接移植，因此当前不建议自行增加。
+
+### 严重问题 2：当前 MSP action expert 仍使用 pi0.5 adaRMS，不等价于 MINT
+
+当前初始化：
+- `_gemma.Module(..., adarms=config.pi05)`
+- `use_adarms=[False, True]`
+- MSP forward 给 action expert 传一个全 0 `adarms_cond`
+
+这不等于关闭 adaRMS：
+- `cond=None` 才走普通 RMSNorm 和普通 residual
+- `cond=zeros` 仍走 adaptive RMSNorm 的 Dense modulation 和 gated residual
+- 预训练 adaRMS Dense 的 bias 可以使全 0 cond 产生非零 scale/shift/gate
+- 因此当前 MSP 头仍带着原 flow timestep 调制结构，只是 timestep 被错误替换成常量 0 向量
+
+MINT 的明确做法：
+- action expert 初始化为 `use_adarms=[False, False]`
+- forward 使用 `adarms_cond=[None, None]`
+- 即多尺度 AR action expert 使用普通 RMSNorm，不保留 flow timestep modulation
+
+推荐修改方向：
+- MSP 模式下把 action expert 初始化成普通 RMSNorm
+- MSP forward 传 `[None, None]`
+- VLM expert 仍保持原结构和权重，不受影响
+
+但这不能只改 forward：
+- JAX Linen 的普通 RMSNorm 参数是 `scale`
+- adaRMS 参数是 modulation Dense kernel/bias
+- 两种初始化得到的参数树不同
+- 直接把当前 `adarms_cond=zeros` 改成 `None` 会出现普通 RMSNorm `scale` 参数不存在的问题
+
+所以必须同时修改：
+1. Gemma action expert 初始化模式
+2. pi0.5 checkpoint loader：继续加载 attention/MLP 等兼容参数
+3. 跳过 action-expert adaRMS modulation 参数
+4. 对新普通 RMSNorm `scale` 做确定的初始化并输出加载统计
+
+在看到实际 pi0.5 checkpoint 展平 key 之前，不凭空编写 norm key regex。
+
+### 高优先级问题 3：block-local RoPE 只实现了 reset，未复现 MSP 的频率缩放
+
+MSP 原版：
+- 每个尺度 block 的位置从 0 重新开始，这部分当前已实现
+- 但 `ActionRotaryEmbeddingFast` 还执行：
+  - `t = arange(seq_len) / pt_seq_len`
+- `pt_seq_len=max(scale)`，默认 `(1,2,4,8)` 时为 8
+
+当前 JAX Gemma：
+- 自定义 suffix `rope_positions` 是整数 `0..scale-1`
+- `_apply_rope()` 直接使用该值
+- 没有除以 `max(msp_scales)`
+
+因此当前 RoPE 相位比 MSP 原版大 `max_scale` 倍，并非完全一致。
+
+推荐修改：
+- 让 suffix 自定义 RoPE position 支持 float
+- MSP suffix 使用：
+  - `local_position / max(msp_scales)`
+- prefix/VLM 继续使用原始 Gemma 全局整数 position，不改变
+- 训练全尺度和推理分尺度必须调用同一 helper
+
+### 中优先级问题 4：推理 global position offset 与训练/MINT 写法不一致
+
+当前推理：
+- `start = prefix_mask.shape[1] + block_start`
+
+训练和 MINT：
+- suffix 起点基于每个样本有效 prefix token 数：
+  - `sum(prefix_mask)`
+
+目前 suffix 已覆盖自定义 RoPE，所以这个差异通常不会改变 suffix Q/K 的旋转位置；但它仍是语义不一致，也会给后续取消自定义 RoPE或调整 cache 留下隐患。
+
+推荐修改：
+- 使用：
+  - `sum(prefix_mask, axis=-1)[:, None] + block_start + arange(current_scale)`
+
+### 已确认正确、无需重写的部分
+
+1. 多尺度 target
+- 最细 VAE latent 线性 resize 到 `(1,2,4,8)`
+- 与 MSP 一致
+
+2. 尺度间传递
+- 上一尺度先上采样到最大尺度，再下采样到下一尺度
+- 训练使用 GT 上一尺度，推理使用预测上一尺度
+- 与 MSP 一致
+
+3. 尺度 block mask
+- 当前尺度可见 prefix、所有历史尺度和当前尺度全部 token
+- 不可见未来尺度
+- 与 MSP/MINT 一致
+
+4. KV cache 生命周期
+- prefix/VLM 只运行一次
+- 每个尺度只输入当前 block
+- cache 逐尺度追加
+- 与 MINT 和 MSP 推理思想一致
+
+5. scale embedding
+- 训练使用完整绝对 scale ID
+- 推理已修复为使用当前 `block_index`
+- 与 MINT 一致
+
+6. SOS
+- 训练和推理第 0 尺度使用同一 learned SOS
+- 与 MINT 一致
+
+7. Stage-1 latent/decoder
+- 训练使用 VAE posterior sample，并 stop-gradient
+- 推理把最细尺度 continuous latent 送 Stage-1 decoder
+- 与无 flow 的 MSP 连续 latent 路径一致
+
+8. per-scale loss weighting
+- 每尺度 loss 乘 `scale / max_scale` 后求和
+- 与 MSP 原版一致
+
+### 推荐的下一轮修改顺序
+
+1. 先删除三组错误映射的 learned positional embeddings
+2. 再把 MSP action expert 从 adaRMS 改成普通 RMSNorm，并同步 checkpoint 参数迁移
+3. 然后补齐 MSP RoPE 的 `/ max_scale` 频率缩放
+4. 最后统一推理 position offset，并做训练整段 forward 与增量 cache forward 的数值等价测试
+
+这四步完成之前，不能认为当前动作头已经和 MINT 的 pi0.5 适配以及 MSP 的尺度细节完全一致。
+
+## 2026-08-31 执行适配修正第 1 步：删除错误映射的三组位置表
+
+本轮只处理上一节的严重问题 1，不同时修改 adaRMS 或 RoPE，保证每个结构变化可以独立检查。
+
+已删除：
+- `msp_encoder_pos_embed`
+- `msp_decoder_pos_embed`
+- `msp_diffusion_pos_embed`
+- `_msp_pos_slice()`
+- `msp_scale_head.slice_scale_positions()`
+- 对应的位置切片单元测试
+
+修改后的 suffix 输入：
+- 第 0 尺度：
+  - `msp_sos_token + msp_scale_embed(scale_id=0)`
+- 后续尺度：
+  - `msp_latent_in_proj(resized_previous_latent) + msp_scale_embed(scale_id=i)`
+- 时间位置：
+  - 只通过 Gemma action expert 的 block-local RoPE 注入
+
+修改后的 suffix 输出：
+- 训练：
+  - `msp_latent_out_proj(suffix_out)`
+- 推理：
+  - `msp_latent_out_proj(current_scale_suffix_out)`
+- 不再叠加没有 diffusion head 与 decoder stack 对应的 learned position
+
+结构依据：
+- 对齐 MINT 的单 action-expert Gemma 骨架
+- 保留 MSP 的连续 latent、多尺度 resize、block-local RoPE 和 per-scale loss
+- 不再把 MSP 双 Transformer + flow head 的位置参数硬映射到单 Gemma stack
+
+验证：
+- 已通过 `py_compile`：
+  - `openpi/src/openpi/models/pi0.py`
+  - `openpi/src/openpi/models/msp_scale_head.py`
+  - `openpi/src/openpi/models/msp_scale_head_test.py`
+- 已通过 `git diff --check`
+- `rg` 确认 `openpi/src/openpi` 中没有三组旧位置参数及切片 helper 的残留引用
+- 本地环境仍缺少 JAX/pytest，因此运行时单元测试留到服务器环境执行
+
+checkpoint 兼容性：
+- 从原始 pi0.5 权重 + Stage-1 VAE 权重启动新的 Stage-2：兼容
+- 旧版 Stage-2 checkpoint 包含已经删除的位置参数，并且缺少/不同于当前结构，不应作为新结构的完整 checkpoint 直接 resume
+
+下一步：
+- 把 MSP action expert 从 pi0.5 adaRMS 常量零条件，改成 MINT 使用的普通 RMSNorm
+- 必须同步处理 pi0.5 action-expert checkpoint 的 norm 参数迁移和加载日志
+
+## 2026-08-31 执行适配修正第 2 步：MSP action expert 改为普通 RMSNorm
+
+本轮完成 MINT 动作头适配中与 adaRMS 相关的结构修正。
+
+### 1. MSP 模式关闭 action-expert adaRMS
+
+`pi0.py` 现在显式计算：
+- 普通 pi0.5 flow 模式：`use_action_expert_adarms=True`
+- pi0.5 + MSP 模式：`use_action_expert_adarms=False`
+
+Gemma 初始化同步使用：
+- VLM expert：普通 RMSNorm，保持不变
+- MSP action expert：普通 RMSNorm
+
+MSP 训练和推理 forward 都改为：
+- `adarms_cond=[None, None]`
+
+已删除 MSP suffix 中原来的全 0 `adarms_cond`。
+
+这与 MINT 的：
+- `use_adarms=[False, False]`
+- `adarms_cond=[None, None]`
+保持一致。
+
+### 2. MSP 模式不再创建 flow-only 参数
+
+以下参数只在原 pi0/pi0.5 flow 路径创建：
+- `action_in_proj`
+- `action_out_proj`
+- `time_mlp_in/time_mlp_out`
+- `state_proj`
+- `action_time_mlp_in/action_time_mlp_out`
+
+MSP 模式只创建自己的：
+- `msp_latent_in_proj`
+- `msp_latent_out_proj`
+- `msp_scale_embed`
+- `msp_sos_token`
+- `msp_action_vae`
+
+这样 MSP action head 的参数树不再保留不会参与 forward 的 flow 参数。
+
+### 3. SOS 初始化对齐 MINT
+
+之前 `msp_sos_token` 使用 std=0.02 的随机正态初始化。
+
+MINT 原版是：
+- `nn.Parameter(torch.zeros(1, 1, width))`
+
+现在 JAX 版改为全 0初始化，后续通过训练更新。
+
+### 4. pi0.5 checkpoint 参数迁移
+
+新增：
+- `weight_loaders.MSP_ACTION_EXPERT_MISSING_REGEX`
+
+它允许目标模型保留初始化值的参数包括：
+- MSP 新动作头参数
+- LoRA 参数
+- action expert 普通 RMSNorm：
+  - `pre_attention_norm_1/scale`
+  - `pre_ffw_norm_1/scale`
+  - `final_norm_1/scale`
+
+checkpoint 合并行为：
+- attention/MLP 等目标模型中存在且同名的 pi0.5 action-expert 权重正常加载
+- checkpoint 中只属于 adaRMS modulation Dense 的参数因目标模型不存在而忽略
+- 新普通 RMSNorm scale 从目标模型初始化值保留
+- MSP projection/scale/SOS 从目标模型初始化值保留
+
+加载日志新增三类统计：
+- `loaded`
+- `initialized_from_target`
+- `ignored_checkpoint_only`
+
+明细只打印前 20 个示例，避免 Stage-1 合并时刷屏。
+
+### 5. Stage-1 VAE 合并语义收紧
+
+复核时曾怀疑 base 随机 MSP 参数会覆盖 Stage-1 VAE；继续检查发现：
+- `_load_weights_and_validate()` 会过滤 `ShapeDtypeStruct`
+- 所以旧逻辑下 base partial params 通常并不包含随机 MSP 数组
+- 不能把它定性为已经发生的覆盖 bug
+
+但旧实现依赖这个隐含过滤行为，不够清晰。本轮改为：
+- `merge_msp_vae_params()` 只返回真正匹配的 Stage-1 VAE 数组
+- 不再返回一整棵带 shape fallback 的模型树
+- `train.py/train_tb.py` 显式以 Stage-1 VAE 为 preferred，覆盖 base partial params
+
+最终参数来源现在是明确的：
+- pi0.5 兼容参数来自 base checkpoint
+- MSP VAE 参数来自 Stage-1 checkpoint
+- MSP 新头和普通 action-expert norm 来自新模型初始化
+
+### 6. 新增测试
+
+文件：
+- `openpi/src/openpi/training/weight_loaders_test.py`
+
+覆盖：
+- MSP missing regex 只匹配 MSP/LoRA/新普通 action-expert norm
+- action expert attention 权重从 checkpoint 加载
+- adaRMS checkpoint-only Dense 参数不进入新参数树
+- 普通 RMSNorm scale 和 MSP projection 保留目标初始化值
+
+### 7. 验证
+
+已通过：
+- `py_compile`
+- `git diff --check`
+- regex 样例匹配检查
+- `rg` 确认 MSP 路径没有零 adaRMS 条件和三组旧位置参数残留
+
+本地环境缺少 JAX/Flax/pytest，新增单元测试需在服务器 openpi 环境运行：
+- `pytest openpi/src/openpi/training/weight_loaders_test.py -q`
+
+服务器首次启动 Stage-2 时应重点检查加载日志：
+- 普通 action-expert norm 应出现在 `initialized_from_target` 示例中
+- adaRMS Dense 和已删除 flow-only 参数应出现在 `ignored_checkpoint_only` 示例中
+- `Base model weight load succeeded.`
+- `MSP stage-1 weight load succeeded.`
+
+下一步：
+- 补齐 MSP block-local RoPE 的 `/ max(msp_scales)` 频率缩放
+- 同时统一训练/推理的自定义 RoPE helper 和推理 global position offset
+
+## 2026-08-31 执行适配修正第 3 步：对齐 MSP RoPE 相位与增量位置
+
+本轮完成 MSP `flow_ar.py` 中 RoPE 细节的 JAX 适配，同时不改变 VLM 的原始 Gemma 位置编码。
+
+### 1. MSP 原版 RoPE 的两个必要条件
+
+原版 `ActionRotaryEmbeddingFast` 同时执行：
+1. 每个尺度 block 内位置从 0 开始
+2. 位置除以 `pt_seq_len=max(scale)`
+
+默认尺度 `(1,2,4,8)` 时：
+- 第 4-token 尺度使用：`[0/8, 1/8, 2/8, 3/8]`
+- 第 8-token 尺度使用：`[0/8, ..., 7/8]`
+
+之前 JAX 版只完成第 1 点，使用的是整数 `[0,1,2,...]`，相位比 MSP 原版大 8 倍。
+
+### 2. 新增统一 MSP RoPE helper
+
+文件：
+- `openpi/src/openpi/models/msp_scale_head.py`
+
+新增：
+- `build_msp_rope_positions(scales, batch_size, normalization_length)`
+
+语义：
+- 每个尺度 block 独立生成 `arange(scale)`
+- 统一除以完整 MSP 配置的最细尺度 `msp_scales[-1]`
+- 返回 float32 position
+
+训练：
+- 输入完整 scales `(1,2,4,8)`
+- normalization length 为 8
+
+推理：
+- 每次只输入当前 `(scale,)`
+- normalization length 仍显式使用完整配置的 8
+- 不会错误地按当前 scale 自己归一化
+
+因此训练完整序列中任意 block 的 RoPE position，与推理单独生成该 block 时逐值相同。
+
+### 3. Gemma 只放宽自定义 RoPE position 类型
+
+文件：
+- `openpi/src/openpi/models/gemma.py`
+
+修改：
+- `rope_positions` 从只接受整数改为接受 `at.Real`
+
+未修改：
+- 默认 `positions` 仍然是整数
+- prefix/VLM 不传自定义 RoPE，继续使用原始 Gemma 全局 position
+- 只有 MSP suffix 使用归一化 float position
+
+所以这一步不会改变 VLM 的位置编码和预训练权重语义。
+
+### 4. 推理 global position offset 对齐训练/MINT
+
+新增：
+- `build_incremental_positions(prefix_mask, block_start, block_length)`
+
+之前推理使用：
+- 固定 padded 长度 `prefix_mask.shape[1] + block_start`
+
+现在使用：
+- 每个样本的 `sum(prefix_mask) + block_start + arange(block_length)`
+
+这与：
+- 训练 `cumsum(concat(prefix_mask, suffix_mask)) - 1`
+- MINT `prefix_offsets = sum(prefix_pad_masks)`
+保持一致。
+
+对于 batch 内 prompt 长度不同的样本，各自 suffix global position 不再被统一按最大 padding 长度偏移。
+
+### 5. 新增/更新测试
+
+文件：
+- `openpi/src/openpi/models/msp_scale_head_test.py`
+
+覆盖：
+1. 每个尺度 block 的位置归零
+2. 所有 block 都除以完整最细尺度
+3. 训练全序列 block slice 与推理单 block position 完全一致
+4. batch 内 prefix 有效长度不同时，incremental global position 分别使用各自有效长度
+
+### 6. 验证
+
+已通过：
+- `py_compile`
+- `git diff --check`
+- `rg` 确认旧 `build_block_local_positions`、固定 padded prefix offset 和未使用的 `block_end` 没有残留
+
+本地缺少 JAX/pytest，服务器环境需运行：
+- `pytest openpi/src/openpi/models/msp_scale_head_test.py -q`
+- `pytest openpi/src/openpi/training/weight_loaders_test.py -q`
+
+下一步：
+- 做训练 full-suffix forward 与推理 scale-wise KV-cache forward 的逐尺度数值等价测试
+- 该测试需要固定同一组 teacher-forcing latent，使推理每层输入使用 GT 前一尺度，排除模型预测误差，只比较 full forward 和 cache forward 的 hidden/pred latent
+
+## 2026-09-01 第 4 步：full suffix 与 scale-wise KV cache 数值等价测试
+
+本轮没有继续修改网络结构，而是增加一个隔离测试，验证当前 mask、position、RoPE、普通 RMSNorm 和 KV cache 的组合是否真正做到训练/推理同构。
+
+新增文件：
+- `openpi/src/openpi/models/msp_gemma_cache_test.py`
+
+### 测试设计
+
+使用一个轻量双 expert Gemma：
+- prefix/VLM expert
+- suffix/action expert
+- width=8
+- depth=2
+- 普通 RMSNorm
+- float32
+- dropout=0
+
+不加载：
+- 图像编码器
+- 动作 VAE
+- 真实 checkpoint
+- 数据集
+
+输入固定为：
+- 同一组随机 prefix embedding
+- 同一组随机完整多尺度 suffix embedding
+- scales `(1,2,4)`
+- batch 内两条样本具有不同有效 prefix 长度，用于覆盖 padding 情况
+
+### 路径 A：训练式 full forward
+
+一次输入：
+- 完整 prefix
+- 完整多尺度 suffix
+- 完整 blockwise attention mask
+- 完整 block-local `/ max_scale` RoPE
+- `adarms_cond=[None,None]`
+
+保存完整 `full_suffix_out`。
+
+### 路径 B：推理式 incremental forward
+
+1. prefix 单独 forward 一次，获得 KV cache
+2. 按 `(1,2,4)` 逐尺度输入与路径 A 完全相同的 suffix token slice
+3. 每层使用：
+- 当前尺度 attention rows
+- 每样本有效 prefix global offset
+- 当前尺度 block-local `/ max_scale` RoPE
+- 上一轮 KV cache
+4. 拼接所有尺度输出为 `cached_suffix_out`
+
+最终断言：
+- `cached_suffix_out` 与 `full_suffix_out` 在 `atol=1e-5, rtol=1e-5` 下完全接近
+
+### 该测试覆盖的关键风险
+
+1. full mask 与 incremental mask 的当前尺度 rows 是否一致
+2. prefix padding 是否在两条路径中同样被屏蔽
+3. 每样本 suffix global position offset 是否一致
+4. full block slice 与 incremental block 的 MSP RoPE 是否一致
+5. prefix cache 和历史尺度 cache 的追加顺序是否一致
+6. action expert 普通 RMSNorm 在 full/cache 路径中是否一致
+7. final norm 后的每尺度 hidden state 是否一致
+
+### 与已有 helper 测试的关系
+
+已有测试已经分别锁定：
+- MSP resize teacher forcing 与推理输入规则
+- scale ID
+- block mask rows
+- RoPE block slice
+- global offset
+
+新测试把这些组件放进真实 Gemma attention/cache forward 中做端到端数值比较。
+
+### 当前验证状态
+
+已通过：
+- `py_compile`
+- `git diff --check`
+- 文件行宽检查
+
+尚未执行数值测试：
+- 本地 `openpi/.venv` 没有 JAX/pytest
+- 未为此临时下载 CUDA JAX 或改变用户训练环境
+
+服务器 openpi 环境执行：
+- `pytest openpi/src/openpi/models/msp_gemma_cache_test.py -q`
+
+同时建议一次执行本轮全部相关测试：
+- `pytest openpi/src/openpi/models/msp_scale_head_test.py openpi/src/openpi/models/msp_gemma_cache_test.py openpi/src/openpi/training/weight_loaders_test.py -q`
+
+只有该数值测试通过后，才能确认 action expert 在固定同一输入时 full training forward 与 incremental inference forward 等价；它不解决 teacher forcing 下 GT 输入与真实推理预测输入之间的 exposure bias。
+
 ## 2026-08-27 结论收口：Gemma action head 的 block-local RoPE 已经具备，不需要再重写 attention
 
 这一步先核实了 `Gemma` 是否真的还缺 block-local RoPE。
@@ -2054,4 +3268,178 @@ flow_loss = sum(loss)
 - `openpi/src/openpi/models/msp_scale_head.py`
 - `openpi/src/openpi/models/pi0.py`
 - `openpi/src/openpi/models/msp_scale_head_test.py`
+- `task.md`
+## 2026-09-01 任务 3 扩展：移植 MSP Stage-2 MeanFlow head
+
+新的理解：
+- `MSP/algos/flow/flow_ar.py` 的 Transformer 不直接回归 latent；它输出每个尺度、每个 token 的 condition。
+- condition 和带噪 latent 一起送入 `MPScalseFlowhead`。该 head 实际采用 MeanFlow 训练：log-normal 采样 `t/r`、JVP 构造目标、adaptive L2 优化。
+- 推理不是多步 ODE，而是原版 `generate()` 的单步更新：从高斯噪声 `sample` 得到 `sample - u(sample, t=1, r=0, condition)`。
+- 每个尺度分别计算 flow loss，再按原版 `scale / max_scale` 加权求和。
+- 逐尺度推理时，当前尺度生成的连续 latent 仍按 MSP 的“两次 resize”规则构造下一尺度 Transformer 输入；最终 finest latent 送 Stage-1 VAE decoder。
+
+本轮任务：
+1. 新增 JAX/Flax 版 `MpScaleMlpResNet` 和 `MPScalseFlowhead`。
+2. 用 MeanFlow loss 替换当前 Stage-2 的直接 latent MSE。
+3. 用单步 MeanFlow generation 替换当前 `msp_latent_out_proj` 直接输出 latent。
+4. 保持已有 Gemma 多尺度 mask、block-local RoPE、KV cache、MINT 风格 SOS/scale embedding 不变。
+5. 修复当前 `_compute_msp_loss_with_info()` 漏接 `scale_ends` 的问题。
+
+计划修改文件：
+- `openpi/src/openpi/models/msp_flow_head.py`（新增）
+- `openpi/src/openpi/models/msp_flow_head_test.py`（新增）
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/pi0_config.py`
+- `task.md`
+
+完成情况：
+1. 新增 JAX `MspScaleFlowHead`
+- `LearnedPosEmb`：`randn(std=0.2)` learned Fourier embedding，输出顺序与 PyTorch 一致为 `cos/sin`。
+- `TimeEncoder`：同一组参数分别编码 `t` 和 `r`，再相加。
+- `MlpResNetBlock`：`Dropout -> LayerNorm -> Dense(4H) -> GELU -> Dense(H) -> residual`。
+- head 默认保持原版参数：3 blocks、hidden 256、time dim 32、time hidden 256、dropout 0.1。
+- pi0.5 action expert 的 hidden width 只作为 condition dimension，不擅自放大 flow hidden width。
+
+2. Stage-2 训练改为原版 MeanFlow
+- Stage-1 VAE sampled latent 继续 `stop_gradient`。
+- Gemma action expert 输出作为 flow condition，不再经 `msp_latent_out_proj` 直接回归 latent。
+- 每个尺度独立采样高斯 noise 和 log-normal `t/r`。
+- 50% batch 样本设置 `r=t`。
+- `v_hat = 2 * v - u_t`，其中 guide `u_t` stop-gradient。
+- 用 `jax.jvp` 计算方向导数，构造 `u_tgt = v_hat - (t-r) * dudt`。
+- 使用 MSP adaptive L2，并继续按 `scale / max_scale` 加权。
+
+3. Stage-2 推理改为原版单步 Flow
+- 每个尺度独立采样 `[B, scale, latent_dim]` 高斯噪声。
+- Gemma 当前尺度 hidden 作为 condition。
+- 执行 `sample - model(sample, t=1, r=0, condition)`。
+- 生成 latent 按现有 MSP resize 规则传给下一尺度，finest latent 由 Stage-1 decoder 解码。
+- `sample_actions()` 现在实际使用传入的 RNG；不再产生固定 latent。
+
+4. 指标
+- 新增 `msp_flow_loss_scale_<scale>`、对应 weighted 指标和 `msp_flow_mse_scale_<scale>`。
+- 新增 `msp_flow_loss_total`、`msp_flow_loss_finest`。
+- 保留原 `msp_loss_*` 名称作为 MeanFlow loss 的兼容别名，旧 TensorBoard 面板无需修改。
+
+5. 配置和权重
+- `Pi0Config` 新增 `msp_flow_*` 参数，默认值对齐 MSP 原版。
+- 新 flow 参数路径属于 `msp_flow_head/...`，现有 `.*msp.*` missing regex 会在加载 pi0.5 时跳过并随机初始化。
+- Stage-1 checkpoint 仍只覆盖 `msp_action_vae/...`；flow head 按 Stage-2 新参数训练。
+- 旧的“直接 latent MSE” Stage-2 checkpoint 与新 flow 结构不是严格 resume-compatible，应从 pi0.5 base + Stage-1 VAE 权重重新启动新 Stage-2 实验。
+
+6. 修复
+- 修复 `_compute_msp_loss_with_info()` 只接收 `scale_starts`、却引用 `scale_ends` 的错误。
+
+验证：
+- `py_compile` 通过。
+- `git diff --check` 通过。
+- 新增 `msp_flow_head_test.py`，覆盖 `t/r` 约束、adaptive L2、模块/JVP shape 与有限值、单步生成公式。
+- 项目 `.venv` 缺少 JAX 和 pytest，因此使用阿里云 PyPI 镜像在 `/tmp/msp-flow-test` 创建了隔离 CPU 环境，没有改项目环境或锁文件。
+- 已运行 `msp_flow_head_test.py + msp_scale_head_test.py`：`11 passed`。
+- 测试额外覆盖 `ToNNX` bridge 下的 MeanFlow JVP、参数梯度存在且有限。
+- 完整 Pi0.5 + 图像/VLM 训练 smoke test 仍需在服务器正式 openpi 环境和真实数据上运行。
+
+本轮实际修改文件：
+- `openpi/src/openpi/models/msp_flow_head.py`
+- `openpi/src/openpi/models/msp_flow_head_test.py`
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/pi0_config.py`
+- `task.md`
+## 2026-09-01 Stage-1 VAE 与原版 MSP 逐层复核
+
+复核基准：
+- `MSP/algos/vae/vae.py`
+- `MSP/config/algo/action_vae.yaml`
+- `MSP/config/algo/MSP.yaml`
+
+确认无需修改的超参：
+- 原版实际 YAML（不是 `ActionVAE.__init__` 的未覆盖默认值）使用：
+  - encoder/decoder dim = 128
+  - downsample factor = 4
+  - encoder heads/layers = 2/2
+  - decoder heads/layers = 4/4
+  - latent dim = 16
+  - KL weight = 1e-6
+- 当前 Stage-1 和 Stage-2 VAE 配置与这些值一致。
+
+确认需要修正的实现差异：
+1. 正弦位置编码
+- 原版 `positional_encodings.PositionalEncoding1D` 按频率交错排列：
+  `[sin0, cos0, sin1, cos1, ...]`。
+- 当前 JAX 版是先拼全部 sin、再拼全部 cos，语义不一致。
+
+2. Transformer residual dropout
+- PyTorch `TransformerEncoderLayer/DecoderLayer(norm_first=True)` 在每个 attention 和 FF block 输出后都有 dropout，再与 residual 相加。
+- 当前 JAX 版只有 attention-weight dropout 和 FF 中间 dropout，缺少 residual branch 输出 dropout。
+
+3. Attention dropout mask
+- PyTorch attention dropout 对 batch/head/query/key 独立采样。
+- Flax MHA 默认 `broadcast_dropout=True` 会跨 batch/head 共享，需要设为 `False`。
+
+4. GELU
+- PyTorch `activation='gelu'` 使用 exact GELU。
+- Flax `nn.gelu` 默认 approximate=True，需要显式 `approximate=False`。
+
+5. Norm epsilon
+- PyTorch Transformer LayerNorm 和 GroupNorm 默认 epsilon 都是 `1e-5`。
+- Flax 两者默认 `1e-6`，需要显式对齐。
+
+6. 参数初始化
+- 原版普通 Linear/Conv 使用 PyTorch default Kaiming-uniform 等价范围 `[-1/sqrt(fan_in), 1/sqrt(fan_in)]`，bias 同范围。
+- 原版 MHA Q/K/V 使用 combined in-projection Xavier uniform；out projection 使用 Linear default，attention biases 在 reset 时为 0。
+- 当前 Flax 默认是 LeCun normal + zero bias，需要为新训练显式对齐；参数 shape/name 不变，已有 checkpoint 加载不受影响。
+
+7. Stage-2 冻结 VAE 的 train/eval 状态
+- 原版只执行 `autoencoder.requires_grad_(False)`，外层每轮仍执行 `model.train()`，所以 Stage-2 编码 latent 时 VAE dropout 仍启用。
+- 当前 Stage-2 强制 `train=False`，需要改为跟随 Stage-2 的 `train`，同时继续 stop-gradient 和冻结 VAE 参数。
+
+计划修改文件：
+- `openpi/src/openpi/models/msp_vae.py`
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/msp_vae_test.py`（新增）
+- `task.md`
+
+完成情况：
+1. 已修正位置编码为 MSP 原版交错 sin/cos，并支持原版对奇数 channel 的截断行为。
+2. Encoder 每层已对齐：
+- pre-LayerNorm epsilon 1e-5
+- MHA attention dropout 不跨 batch/head 广播
+- attention 输出 dropout 后再 residual
+- exact GELU
+- FF 中间 dropout + FF 输出 dropout
+3. Decoder 每层已对齐：
+- self-attention、cross-attention、FF 三个 residual branch 都增加原版输出 dropout
+- Norm epsilon、attention dropout 和 GELU 同 Encoder
+4. Temporal Conv 已对齐：
+- causal 路径保持与 PyTorch“对称 padding 后裁右侧”等价的左 padding 实现
+- non-causal 路径改成显式 `kernel//2` 双侧 padding，保留偶数 kernel 时 PyTorch 输出 `L+1` 的行为
+- GroupNorm epsilon 改为 1e-5
+5. 初始化已对齐：
+- Linear/Conv kernel 和 bias 使用 PyTorch default uniform bounds
+- MHA Q/K/V 使用原版 combined in-projection Xavier uniform 的边缘分布
+- MHA out projection 使用 Linear default，attention bias 为 0
+6. Stage-2 VAE 状态已对齐：
+- VAE 参数仍由 freeze filter 冻结，latent 仍 stop-gradient
+- Stage-2 train 时 VAE encoder dropout 改为启用；eval/inference 时关闭
+7. 没有修改原版 YAML 已明确覆盖的 VAE 超参。
+
+新增测试：
+- `msp_vae_test.py`
+- 覆盖交错位置编码、downsample/latent/decode shape、train/eval dropout、PyTorch 初始化范围、非因果偶数卷积长度。
+
+验证结果：
+- `msp_vae_test.py + msp_flow_head_test.py + msp_scale_head_test.py`：`16 passed`
+- `py_compile` 通过
+- `git diff --check` 通过
+- 本地数值测试使用 `/tmp/msp-flow-test` 隔离 CPU JAX/Flax 环境；由于该环境不含完整 openpi/PyTorch 依赖，仅对 import 依赖使用测试进程内模块桩，不影响被测试的 Linen VAE 实现。
+
+checkpoint 结论：
+- 本轮没有改变 VAE 参数 key/shape，旧 Stage-1 checkpoint 可以加载。
+- 但旧 checkpoint 是在旧位置编码/dropout/epsilon 语义下训练的，不应视为“原版对齐权重”。
+- 建议重新训练 Stage-1，并用新 Stage-1 权重重新训练当前 MeanFlow Stage-2。
+
+本轮实际修改文件：
+- `openpi/src/openpi/models/msp_vae.py`
+- `openpi/src/openpi/models/pi0.py`
+- `openpi/src/openpi/models/msp_vae_test.py`
 - `task.md`

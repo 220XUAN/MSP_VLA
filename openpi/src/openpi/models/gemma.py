@@ -398,7 +398,7 @@ class Module(nn.Module):
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
         adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
-        rope_positions: Sequence[at.Int[at.Array, "b _t"] | None] | None = None,
+        rope_positions: Sequence[at.Real[at.Array, "b _t"] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,

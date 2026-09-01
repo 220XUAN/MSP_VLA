@@ -37,9 +37,26 @@ def build_scale_ar_mask(scales: tuple[int, ...]) -> jnp.ndarray:
     return jnp.asarray(mask, dtype=jnp.bool_)
 
 
-def build_block_local_positions(scales: tuple[int, ...], *, batch_size: int) -> jnp.ndarray:
-    positions = jnp.concatenate([jnp.arange(scale, dtype=jnp.int32) for scale in scales], axis=0)
+def build_msp_rope_positions(
+    scales: tuple[int, ...], *, batch_size: int, normalization_length: int
+) -> jnp.ndarray:
+    """Build MSP block-local RoPE positions normalized by the finest scale."""
+    if normalization_length < max(scales):
+        raise ValueError(
+            f"normalization_length must cover every scale, got {normalization_length} for {scales}"
+        )
+    positions = jnp.concatenate([jnp.arange(scale, dtype=jnp.float32) for scale in scales], axis=0)
+    positions = positions / float(normalization_length)
     return jnp.broadcast_to(positions[None, :], (batch_size, positions.shape[0]))
+
+
+def build_incremental_positions(
+    prefix_mask: jnp.ndarray, *, block_start: int, block_length: int
+) -> jnp.ndarray:
+    """Build global cache-layout positions from each sample's valid prefix length."""
+    prefix_offsets = jnp.sum(prefix_mask, axis=-1, dtype=jnp.int32)[:, None]
+    block_positions = block_start + jnp.arange(block_length, dtype=jnp.int32)[None, :]
+    return prefix_offsets + block_positions
 
 
 def build_scale_segment_bounds(scales: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
@@ -47,16 +64,6 @@ def build_scale_segment_bounds(scales: tuple[int, ...]) -> tuple[np.ndarray, np.
     ends = np.cumsum(scales, dtype=np.int32)
     starts = ends - np.asarray(scales, dtype=np.int32)
     return starts, ends
-
-
-def slice_scale_positions(pos_embed: jnp.ndarray, scales: tuple[int, ...], block_index: int | None) -> jnp.ndarray:
-    """Training uses the full learned position table; inference slices one scale block."""
-    if block_index is None:
-        return pos_embed
-    starts, ends = build_scale_segment_bounds(scales)
-    start = int(starts[block_index])
-    end = int(ends[block_index])
-    return pos_embed[:, start:end, :]
 
 
 def build_blockwise_visibility(scales: tuple[int, ...]) -> jnp.ndarray:
@@ -136,7 +143,12 @@ def build_full_attention_mask(
     return jnp.concatenate([top, bottom], axis=1)
 
 
-def build_scale_ids(scales: tuple[int, ...]) -> jnp.ndarray:
+def build_scale_ids(scales: tuple[int, ...], *, block_index: int | None = None) -> jnp.ndarray:
+    """Build level IDs for full-sequence training or one inference block."""
+    if block_index is not None:
+        if len(scales) != 1:
+            raise ValueError("block_index requires exactly one current inference scale")
+        return jnp.full((scales[0],), block_index, dtype=jnp.int32)
     return jnp.concatenate([jnp.full((scale,), i, dtype=jnp.int32) for i, scale in enumerate(scales)], axis=0)
 
 

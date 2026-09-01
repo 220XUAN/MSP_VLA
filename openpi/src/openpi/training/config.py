@@ -744,7 +744,7 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
-            missing_regex=".*lora.*|.*msp.*",
+            missing_regex=weight_loaders.MSP_ACTION_EXPERT_MISSING_REGEX,
         ),
         batch_size=128,
         fsdp_devices=2,

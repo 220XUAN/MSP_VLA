@@ -50,6 +50,17 @@ class Pi0Config(_model.BaseModelConfig):
     msp_kl_weight: float = 1e-6
     msp_latent_horizon: int | None = None
     msp_scales: tuple[int, ...] | None = None
+    msp_flow_num_blocks: int = 3
+    msp_flow_hidden_dim: int = 256
+    msp_flow_time_dim: int = 32
+    msp_flow_time_hidden_dim: int = 256
+    msp_flow_dropout_rate: float = 0.1
+    msp_flow_ratio: float = 0.5
+    msp_flow_lognormal_mean: float = -0.4
+    msp_flow_lognormal_std: float = 1.0
+    msp_flow_cfg_scale: float = 2.0
+    msp_flow_adaptive_gamma: float = 0.5
+    msp_flow_adaptive_c: float = 1e-3
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -89,6 +100,14 @@ class Pi0Config(_model.BaseModelConfig):
                 )
             if any(a >= b for a, b in zip(self.msp_scales[:-1], self.msp_scales[1:], strict=True)):
                 raise ValueError(f"msp_scales must be strictly increasing, got {self.msp_scales}")
+            if self.msp_flow_num_blocks < 1:
+                raise ValueError("msp_flow_num_blocks must be positive")
+            if self.msp_flow_time_dim % 2 != 0:
+                raise ValueError("msp_flow_time_dim must be even")
+            if not 0.0 <= self.msp_flow_dropout_rate < 1.0:
+                raise ValueError("msp_flow_dropout_rate must be in [0, 1)")
+            if not 0.0 <= self.msp_flow_ratio <= 1.0:
+                raise ValueError("msp_flow_ratio must be in [0, 1]")
 
     @property
     @override

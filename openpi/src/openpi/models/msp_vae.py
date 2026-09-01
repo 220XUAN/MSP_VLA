@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import dataclasses
 import math
 
@@ -13,6 +15,42 @@ from openpi.models import pi0_config
 from openpi.shared import array_typing as at
 
 
+_PYTORCH_NORM_EPS = 1e-5
+
+
+def _uniform_initializer(bound: float):
+    def init(key: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32) -> jnp.ndarray:
+        return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
+
+    return init
+
+
+def _pytorch_default_kernel_init(
+    key: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32
+) -> jnp.ndarray:
+    fan_in = math.prod(shape[:-1])
+    return _uniform_initializer(1.0 / math.sqrt(fan_in))(key, shape, dtype)
+
+
+def _pytorch_mha_qkv_kernel_init(
+    key: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32
+) -> jnp.ndarray:
+    # PyTorch initializes one combined [3D, D] in-projection with Xavier
+    # uniform, so each separated Q/K/V matrix uses variance 0.5 / D.
+    fan_in = shape[0]
+    bound = math.sqrt(1.5 / fan_in)
+    return _uniform_initializer(bound)(key, shape, dtype)
+
+
+def _pytorch_dense(features: int, input_features: int, *, name: str | None = None) -> nn.Dense:
+    return nn.Dense(
+        features,
+        kernel_init=_pytorch_default_kernel_init,
+        bias_init=_uniform_initializer(1.0 / math.sqrt(input_features)),
+        name=name,
+    )
+
+
 def _mish(x: jnp.ndarray) -> jnp.ndarray:
     return x * jnp.tanh(jax.nn.softplus(x))
 
@@ -22,12 +60,12 @@ def _num_groups(channels: int, requested: int) -> int:
 
 
 def _sinusoidal_positions(length: int, dim: int, dtype: jnp.dtype) -> jnp.ndarray:
-    if dim % 2 != 0:
-        raise ValueError(f"dim ({dim}) must be divisible by 2")
+    padded_dim = math.ceil(dim / 2) * 2
     position = jnp.arange(length, dtype=jnp.float32)[:, None]
-    div_term = jnp.exp(jnp.arange(0, dim, 2, dtype=jnp.float32) * -(jnp.log(10000.0) / dim))
-    emb = jnp.concatenate([jnp.sin(position * div_term), jnp.cos(position * div_term)], axis=-1)
-    return emb.astype(dtype)
+    inv_freq = 1.0 / (10000 ** (jnp.arange(0, padded_dim, 2, dtype=jnp.float32) / padded_dim))
+    phase = position * inv_freq
+    emb = jnp.stack([jnp.sin(phase), jnp.cos(phase)], axis=-1).reshape(length, padded_dim)
+    return emb[:, :dim].astype(dtype)
 
 
 def _causal_mask(batch_size: int, length: int) -> jnp.ndarray:
@@ -51,6 +89,8 @@ class CausalConv1D(nn.Module):
             kernel_size=(self.kernel_size,),
             strides=(self.stride,),
             padding="VALID",
+            kernel_init=_pytorch_default_kernel_init,
+            bias_init=_uniform_initializer(1.0 / math.sqrt(self.kernel_size * x.shape[-1])),
         )(x)
 
 
@@ -70,9 +110,14 @@ class Conv1DBlock(nn.Module):
                 self.features,
                 kernel_size=(self.kernel_size,),
                 strides=(self.stride,),
-                padding="SAME",
+                padding=((self.kernel_size // 2, self.kernel_size // 2),),
+                kernel_init=_pytorch_default_kernel_init,
+                bias_init=_uniform_initializer(1.0 / math.sqrt(self.kernel_size * x.shape[-1])),
             )(x)
-        x = nn.GroupNorm(num_groups=_num_groups(self.features, self.num_groups))(x)
+        x = nn.GroupNorm(
+            num_groups=_num_groups(self.features, self.num_groups),
+            epsilon=_PYTORCH_NORM_EPS,
+        )(x)
         return _mish(x)
 
 
@@ -104,20 +149,27 @@ class TransformerEncoderBlock(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, *, mask: jnp.ndarray | None, train: bool) -> jnp.ndarray:
         residual = x
-        x = nn.LayerNorm()(x)
+        x = nn.LayerNorm(epsilon=_PYTORCH_NORM_EPS)(x)
         x = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             dropout_rate=self.dropout_rate,
+            broadcast_dropout=False,
             deterministic=not train,
+            kernel_init=_pytorch_mha_qkv_kernel_init,
+            out_kernel_init=_pytorch_default_kernel_init,
+            bias_init=nn.initializers.zeros_init(),
+            out_bias_init=nn.initializers.zeros_init(),
         )(x, x, x, mask=mask)
+        x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
         x = residual + x
 
         residual = x
-        x = nn.LayerNorm()(x)
-        x = nn.Dense(4 * self.width)(x)
-        x = nn.gelu(x)
+        x = nn.LayerNorm(epsilon=_PYTORCH_NORM_EPS)(x)
+        x = _pytorch_dense(4 * self.width, self.width)(x)
+        x = nn.gelu(x, approximate=False)
         x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
-        x = nn.Dense(self.width)(x)
+        x = _pytorch_dense(self.width, 4 * self.width)(x)
+        x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
         return residual + x
 
 
@@ -137,29 +189,42 @@ class TransformerDecoderBlock(nn.Module):
         train: bool,
     ) -> jnp.ndarray:
         residual = x
-        x = nn.LayerNorm()(x)
+        x = nn.LayerNorm(epsilon=_PYTORCH_NORM_EPS)(x)
         x = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             dropout_rate=self.dropout_rate,
+            broadcast_dropout=False,
             deterministic=not train,
+            kernel_init=_pytorch_mha_qkv_kernel_init,
+            out_kernel_init=_pytorch_default_kernel_init,
+            bias_init=nn.initializers.zeros_init(),
+            out_bias_init=nn.initializers.zeros_init(),
         )(x, x, x, mask=self_mask)
+        x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
         x = residual + x
 
         residual = x
-        x = nn.LayerNorm()(x)
+        x = nn.LayerNorm(epsilon=_PYTORCH_NORM_EPS)(x)
         x = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             dropout_rate=self.dropout_rate,
+            broadcast_dropout=False,
             deterministic=not train,
+            kernel_init=_pytorch_mha_qkv_kernel_init,
+            out_kernel_init=_pytorch_default_kernel_init,
+            bias_init=nn.initializers.zeros_init(),
+            out_bias_init=nn.initializers.zeros_init(),
         )(x, memory, memory, mask=cross_mask)
+        x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
         x = residual + x
 
         residual = x
-        x = nn.LayerNorm()(x)
-        x = nn.Dense(4 * self.width)(x)
-        x = nn.gelu(x)
+        x = nn.LayerNorm(epsilon=_PYTORCH_NORM_EPS)(x)
+        x = _pytorch_dense(4 * self.width, self.width)(x)
+        x = nn.gelu(x, approximate=False)
         x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
-        x = nn.Dense(self.width)(x)
+        x = _pytorch_dense(self.width, 4 * self.width)(x)
+        x = nn.Dropout(self.dropout_rate)(x, deterministic=not train)
         return residual + x
 
 
@@ -186,7 +251,7 @@ class ActionVAELinen(nn.Module):
 
     @nn.compact
     def encode(self, actions: jnp.ndarray, *, train: bool = False) -> jnp.ndarray:
-        x = nn.Dense(self.encoder_dim, name="action_proj")(actions)
+        x = _pytorch_dense(self.encoder_dim, self.action_dim, name="action_proj")(actions)
         kernel_sizes, strides = self._conv_schedule()
         x = ResidualTemporalBlock(
             self.encoder_dim,
@@ -221,12 +286,12 @@ class ActionVAELinen(nn.Module):
                 self.attn_pdrop,
                 name=f"decoder_block_{i}",
             )(x, codes, self_mask=self_mask, cross_mask=cross_mask, train=train)
-        return nn.Dense(self.action_dim, name="action_head")(x)
+        return _pytorch_dense(self.action_dim, self.decoder_dim, name="action_head")(x)
 
     @nn.compact
     def get_sample(self, actions: jnp.ndarray, sample_rng: at.KeyArrayLike, *, train: bool = False) -> jnp.ndarray:
         h = self.encode(actions, train=train)
-        moments = nn.Dense(self.latent_dim * 2, name="quant_proj")(h)
+        moments = _pytorch_dense(self.latent_dim * 2, self.encoder_dim, name="quant_proj")(h)
         mean, logvar = jnp.split(moments, 2, axis=-1)
         logvar = jnp.clip(logvar, -30.0, 20.0)
         return mean + jnp.exp(0.5 * logvar) * jax.random.normal(sample_rng, mean.shape, dtype=mean.dtype)
@@ -234,13 +299,13 @@ class ActionVAELinen(nn.Module):
     @nn.compact
     def encode_mean(self, actions: jnp.ndarray, *, train: bool = False) -> jnp.ndarray:
         h = self.encode(actions, train=train)
-        moments = nn.Dense(self.latent_dim * 2, name="quant_proj")(h)
+        moments = _pytorch_dense(self.latent_dim * 2, self.encoder_dim, name="quant_proj")(h)
         mean, _ = jnp.split(moments, 2, axis=-1)
         return mean
 
     @nn.compact
     def get_action(self, z: jnp.ndarray, *, train: bool = False) -> jnp.ndarray:
-        z = nn.Dense(self.decoder_dim, name="post_quant_proj")(z)
+        z = _pytorch_dense(self.decoder_dim, self.latent_dim, name="post_quant_proj")(z)
         return self.decode(z, train=train)
 
     @nn.compact
@@ -248,7 +313,7 @@ class ActionVAELinen(nn.Module):
         self, actions: jnp.ndarray, sample_rng: at.KeyArrayLike, *, train: bool = False
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         h = self.encode(actions, train=train)
-        moments = nn.Dense(self.latent_dim * 2, name="quant_proj")(h)
+        moments = _pytorch_dense(self.latent_dim * 2, self.encoder_dim, name="quant_proj")(h)
         mean, logvar = jnp.split(moments, 2, axis=-1)
         logvar = jnp.clip(logvar, -30.0, 20.0)
         z = mean + jnp.exp(0.5 * logvar) * jax.random.normal(sample_rng, mean.shape, dtype=mean.dtype)

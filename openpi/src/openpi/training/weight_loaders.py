@@ -13,6 +13,11 @@ import openpi.shared.download as download
 logger = logging.getLogger(__name__)
 
 
+MSP_ACTION_EXPERT_MISSING_REGEX = (
+    r".*lora.*|.*msp.*|.*(pre_attention_norm_1|pre_ffw_norm_1|final_norm_1).*"
+)
+
+
 @runtime_checkable
 class WeightLoader(Protocol):
     def load(self, params: at.Params) -> at.Params:
@@ -150,17 +155,39 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
 
     # First, take all weights that are a subset of the reference weights.
     result = {}
+    ignored_loaded_keys = []
     for k, v in flat_loaded.items():
         if k in flat_ref:
             result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
+        else:
+            ignored_loaded_keys.append(k)
 
     flat_loaded.clear()
 
     # Then, merge any missing weights as defined by the missing regex.
     pattern = re.compile(missing_regex)
+    initialized_keys = []
     for k in {k for k in flat_ref if pattern.fullmatch(k)}:
         if k not in result:
             result[k] = flat_ref[k]
+            initialized_keys.append(k)
+
+    logger.info(
+        "Checkpoint parameter merge: loaded=%d, initialized_from_target=%d, ignored_checkpoint_only=%d.",
+        len(result) - len(initialized_keys),
+        len(initialized_keys),
+        len(ignored_loaded_keys),
+    )
+    if initialized_keys:
+        logger.info(
+            "Initialized target-only parameter examples: %s",
+            ", ".join(sorted(initialized_keys)[:20]),
+        )
+    if ignored_loaded_keys:
+        logger.info(
+            "Ignored checkpoint-only parameter examples: %s",
+            ", ".join(sorted(ignored_loaded_keys)[:20]),
+        )
 
     return flax.traverse_util.unflatten_dict(result, sep="/")
 
@@ -208,4 +235,9 @@ def merge_msp_vae_params(params: at.Params, params_path: str, *, source_prefix: 
         len(matched),
         source_prefix,
     )
-    return _merge_params(flax.traverse_util.unflatten_dict(remapped, sep="/"), params, missing_regex=".*")
+    matched_params = {
+        key: value.astype(flat_ref[key].dtype) if value.dtype != flat_ref[key].dtype else value
+        for key, value in remapped.items()
+        if key in matched
+    }
+    return flax.traverse_util.unflatten_dict(matched_params, sep="/")
