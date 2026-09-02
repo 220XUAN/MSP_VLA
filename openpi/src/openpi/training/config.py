@@ -107,6 +107,8 @@ class DataConfig:
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
     # If true, bypass observation loading and only materialize action chunks from the raw LeRobot parquet rows.
     action_only: bool = False
+    # Current-state column required to express action-only chunks in the same delta-action space as stage 2.
+    action_only_state_key: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -250,6 +252,17 @@ class SimpleDataConfig(DataConfigFactory):
         )
 
 
+def _with_aloha_delta_actions(data_transforms: _transforms.Group, enabled: bool) -> _transforms.Group:
+    """Apply the shared ALOHA joint-delta/gripper-absolute action convention."""
+    if not enabled:
+        return data_transforms
+    delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+    return data_transforms.push(
+        inputs=[_transforms.DeltaActions(delta_action_mask)],
+        outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotAlohaDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
@@ -285,12 +298,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
         )
-        if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-            )
+        data_transforms = _with_aloha_delta_actions(data_transforms, self.use_delta_joint_actions)
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
@@ -549,17 +557,22 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class ActionOnlyLeRobotDataConfig(DataConfigFactory):
-    """Action-only LeRobot data config for MSP stage-1 VAE training."""
+    """Action/state-only LeRobot data config for MSP stage-1 VAE training."""
 
     action_sequence_keys: Sequence[str] = ("action",)
+    state_key: str = "observation.state"
+    use_delta_joint_actions: bool = True
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _with_aloha_delta_actions(_transforms.Group(), self.use_delta_joint_actions)
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            data_transforms=data_transforms,
             model_transforms=ModelTransformFactory()(model_config),
             action_sequence_keys=self.action_sequence_keys,
             action_only=True,
+            action_only_state_key=self.state_key,
         )
 
 
@@ -694,6 +707,8 @@ _CONFIGS = [
                 asset_id="arx_x5_sim",
             ),
             action_sequence_keys=("action",),
+            state_key="observation.state",
+            use_delta_joint_actions=True,
         ),
         batch_size=512,
         num_workers=8,
@@ -715,10 +730,12 @@ _CONFIGS = [
             use_msp_action_head=True,
             action_horizon=32,
             msp_action_dim=14,
-            msp_use_flow_pos_embed=False,
+            msp_use_flow_pos_embed=True,
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="RoboDojo_sim_arx-x5_v30",
+            use_delta_joint_actions=True,
+            adapt_to_pi=False,
             assets=AssetsConfig(
                 assets_dir=str(_ROBODOJO_ASSETS_DIR),
                 asset_id="arx_x5_sim",

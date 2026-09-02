@@ -3578,3 +3578,174 @@ checkpoint 影响：
 本轮修改文件：
 - `openpi/scripts/train_tb.py`
 - `task.md`
+
+## 2026-09-02 推理首个 chunk 尚可、后续失控的链路审查
+
+现象：
+- 第一个预测 action chunk 稍微正常。
+- 后续 chunk 机械臂乱动并瘫痪。
+
+已确认的部署行为：
+- `deploy.py` 每次推理返回 32 步动作，并完整开环执行这 32 步后才再次调用模型。
+- chunk 内虽然每步更新 observation，但这些 observation 不会用于重新规划当前 chunk。
+- 因此长开环误差是一个需要单独验证的风险，可以先把每次执行长度限制为 4 或 8 步来做对照实验。
+
+已确认正确的输出后处理顺序：
+1. MSP finest latent 由 Stage-1 VAE decoder 解码为归一化动作。
+2. 模型内部为 openpi 接口补到 32 维。
+3. `Unnormalize` 先恢复 action/state 数值范围。
+4. `AbsoluteActions` 用当前原始 state 把关节 delta 转回 absolute action。
+5. `AlohaOutputs` 只保留前 14 维。
+6. XPolicyLab `unpack_robot_state` 将 `[32, 14]` 拆成 32 个双臂动作字典。
+
+发现的高风险不一致：
+- Stage-1 `ActionOnlyLeRobotDataConfig` 只读取原始 `action`，没有 `AlohaInputs` 和 `DeltaActions`，因此 VAE 学到的是 absolute action 表示。
+- Stage-2 `LeRobotAlohaDataConfig` 默认 `use_delta_joint_actions=True`，会在 VAE encode 前把 12 个手臂关节转成相对当前 state 的 delta，夹爪保持 absolute。
+- 因此 Stage-2 用 delta-action latent 训练 Flow，但冻结的 Stage-1 VAE encoder/decoder 是按 absolute action 训练的；这不符合原版 MSP 两阶段使用同一 action 表示的前提。
+- Stage-1 和 Stage-2 还共用 `arx_x5_sim` norm stats。如果该 stats 是按 Stage-2 delta pipeline 计算的，那么 Stage-1 实际是在用 delta stats 归一化 raw absolute action，问题会进一步放大。
+
+当前判断：
+- 这是确定存在的代码语义不一致，比 `msp_flow_pos_embed` 或 32->14 padding 更可能导致动作解码失真。
+- 现有 Stage-1/Stage-2 checkpoint 可以继续用于诊断，但不能证明 MSP 结构本身有效或无效。
+- 修复需要让两阶段使用完全相同的 action transform 和 norm stats。可选方案是：
+  - 两阶段都使用 absolute action，并重新计算 absolute-action norm stats；Stage-1 仍可只加载 action。
+  - Stage-1 额外加载很小的 state 向量，在不加载图像/语言的前提下执行与 Stage-2 相同的 delta transform。
+- 在决定训练语义前不直接修改配置，避免再次产生不可比较的 checkpoint。
+
+诊断开关：
+- `deploy.yml` 新增 `replan_steps: null`，默认仍执行完整预测 chunk，不改变现有评估行为。
+- 设置为 `4` 或 `8` 时，`model.py` 只返回预测 chunk 的前 N 步，使部署循环更早重新调用策略。
+- 如果缩短后明显稳定，主要问题是 32 步开环误差；如果第二次预测仍立即失控，则优先排查 Stage-1/Stage-2 action representation 和 Flow 输出。
+- 该开关只裁剪部署输出，不改变模型、训练目标或 checkpoint 参数。
+
+本轮修改文件：
+- `model.py`
+- `deploy.yml`
+- `task.md`
+
+## 2026-09-02 两阶段 action representation 统一方案
+
+推荐选择：
+- Stage-1 和 Stage-2 都使用与现有 pi0.5 ALOHA pipeline 一致的 delta action。
+- 12 个机械臂关节使用 `action - current_state`，两个夹爪维度保持 absolute，mask 与 `LeRobotAlohaDataConfig` 的 `_transforms.make_bool_mask(6, -1, 6, -1)` 完全一致。
+
+选择 delta 而不是 absolute 的原因：
+- Stage-2 当前已经按 delta action 训练。
+- 推理 output transform 已按 `Unnormalize -> AbsoluteActions(current_state)` 恢复 absolute 控制命令。
+- pi0.5 ALOHA action expert 的既有训练约定也是关节 delta、夹爪 absolute。
+- 继续使用同一套 delta-action norm stats，改动范围比把 Stage-2、推理和 norm stats 全部切到 absolute 更小。
+
+Stage-1 数据加载调整方案：
+- action-only dataset 改为只读取 `action`、当前 `observation.state` 和 `episode_index`，仍不读取/解码图像和语言。
+- action chunk 仍由未来 action 行构造；state 只读取 chunk 起点当前帧的一条 14 维向量。
+- 在 Normalize 前执行与 Stage-2 相同的 `DeltaActions(mask=[6 joint, 1 gripper, 6 joint, 1 gripper])`。
+- Stage-1 和 Stage-2 必须加载同一份由 delta pipeline 计算的 norm stats。
+
+checkpoint 影响：
+- 现有 Stage-1 VAE 是按 raw absolute action 输入训练的，不能继续用于修复后的 delta Stage-2。
+- 修复后需要重新训练 Stage-1，再用新 Stage-1 VAE 重新训练 Stage-2。
+- 只重训 Stage-2 而继续使用旧 absolute-action VAE，无法消除表示不一致。
+
+### 已完成实现
+
+数据配置：
+- `DataConfig` 新增 `action_only_state_key`，明确 Stage-1 action-only loader 所需的当前 state 原始列。
+- `ActionOnlyLeRobotDataConfig` 新增 `state_key` 和 `use_delta_joint_actions`，Stage-1 配置明确使用 `observation.state` 和 delta joint action。
+- 提取 `_with_aloha_delta_actions`，Stage-1 与 Stage-2 不再分别维护 mask；两者共用 `_transforms.make_bool_mask(6, -1, 6, -1)`。
+- Stage-2 配置显式设置 `use_delta_joint_actions=True` 和 `adapt_to_pi=False`，避免默认值变化造成两阶段语义漂移。
+
+Stage-1 loader：
+- parquet 只选择 `action`、`observation.state`、`episode_index`，不选择或解码任何图像、视频和语言列。
+- 每个样本的 state 是 chunk 起点当前帧，action 是从该帧开始的 32 步未来 chunk。
+- episode 末尾用该 episode 最后一帧 action 补齐，与 LeRobot `delta_timestamps` 的 clamp 行为一致，不会跨 episode 取 action。
+- DataLoader 不再构造零 state；真实当前 state 会进入共享的 `DeltaActions`，然后才执行 Normalize 和 VAE model transform。
+
+两阶段送入 VAE 前的 action 顺序现在一致：
+1. 原始 14 维 ALOHA action chunk。
+2. 用 chunk 起点的原始 14 维 state，对维度 `0:6` 和 `7:13` 求 delta；夹爪维度 6、13 保持 absolute。
+3. 使用同一 `arx_x5_sim` norm stats 做 Normalize。
+4. 保持 14 维送入 Stage-1 VAE 或 Stage-2 冻结 VAE encoder，不做 32 维 action padding。
+
+验证覆盖：
+- 新增 action-only dataset 测试，检查只选择 action/state/episode 列及 episode 尾部补齐结果。
+- 新增数值对齐测试，用同一 state/action 分别经过 Stage-1 pipeline 和 Stage-2 `AlohaInputs(adapt_to_pi=False) + DeltaActions` pipeline，要求输出 action 完全一致。
+
+训练要求：
+- 修复后必须重新训练 Stage-1 VAE，再从新 VAE checkpoint 重新训练 Stage-2。
+- 两阶段必须使用同一份按上述 delta pipeline 生成的 `arx_x5_sim` norm stats；不要把旧 absolute-action VAE 与新 pipeline 混用。
+
+本轮修改文件：
+- `README.md`
+- `openpi/src/openpi/training/config.py`
+- `openpi/src/openpi/training/data_loader.py`
+- `openpi/src/openpi/training/data_loader_test.py`
+- `task.md`
+
+## 2026-09-02 Stage-2 delta action 精确语义复核
+
+Stage-2 原始数据路径：
+1. `LeRobotDataset(delta_timestamps={"action": [0/fps, ..., 31/fps]})` 返回当前样本的 `observation.state[t]`，并只把 `action` 扩展为 `action[t:t+32]`；它没有读取 `state[t:t+32]`。
+2. `RepackTransform` 将当前 `observation.state[t]` 命名为 `state`，将未来 action chunk 命名为 `actions`。
+3. 当前配置的 `AlohaInputs(adapt_to_pi=False)` 不改变 state/action 数值，只整理图像和字段结构。
+4. `DeltaActions` 执行 `actions[..., :14] -= expand_dims(where(mask, state[:14], 0), -2)`。因此同一帧 `state[t]` 会广播到整个 32 步 action chunk。
+5. mask 为 `(6, -1, 6, -1)`：关节维度 `0:6`、`7:13` 计算 `action[t+k] - state[t]`，夹爪维度 6、13 保持原始 absolute 值。
+6. 然后才执行 Normalize 和模型输入 transform。
+
+这里的 delta 不是：
+- `action[t+k] - state[t+k]`，因为 Stage-2 根本没有读取未来 state chunk。
+- `action[t+k] - action[t+k-1]`，它不是相邻动作差分。
+
+action 与 state 的关系：
+- 对当前 ALOHA joint-position 数据，state 的 12 个关节维度是当前关节位置，action 对应维度是未来目标关节位置，单位和排列一致，因此可以求上述 delta。
+- 两个夹爪不参与 delta，仍使用 absolute action。
+- 如果数据集 action 实际是速度、力矩或已经是 delta，则不能再套用该变换；当前实现严格沿用现有 pi0.5 ALOHA 配置对该数据集的 joint-position 假设。
+
+Stage-1 对齐方式：
+- Stage-1 读取一帧当前 `observation.state[t]` 不是新增的另一种算法，而是在不读取图像的情况下复现 Stage-2 已有算法所需的最小数据。
+- Stage-1 手工生成 `action[t:t+32]` 是为了绕开 LeRobot 标准 `__getitem__` 的视频解码；其 episode 尾部 clamp 规则与 Stage-2 相同。
+- 从字段整理之后开始，Stage-1 和 Stage-2 调用同一个 `_with_aloha_delta_actions`，不是复制一份近似实现。
+- 因而两阶段 VAE 实际接收的 action 都是同一表示：`joint delta relative to state[t] + absolute gripper`，之后使用同一 norm stats。
+
+时间索引说明：
+- 当前 `delta_timestamps` 从 `0/fps` 开始，因此 chunk 是数据索引上的 `action[t], action[t+1], ..., action[t+31]`，第一项不是 `action[t+1]`。
+- 第一个关节 delta 是 `action[t] - state[t]`，后续依次是 `action[t+k] - state[t]`。
+- 在控制语义上，数据集的 `action[t]` 通常是由 `observation[t]` 条件预测并在紧接着的控制周期执行的命令；这不改变它在 LeRobot 数据中的索引仍为 `t`。
+- Stage-1 和 Stage-2 都从 offset 0 开始，不存在两阶段之间的一帧偏移。
+
+本轮修改文件：
+- `task.md`
+
+## 2026-09-02 Stage-1 VAE 与原版 MSP 复核
+
+`DiagonalGaussianDistribution`：
+- JAX 版本没有保留同名类，但训练实际用到的逻辑已内联在 `ActionVAELinen.__call__` 和 `get_sample` 中。
+- 原版 `torch.chunk(parameters, 2, dim=2)` 对应 JAX `jnp.split(moments, 2, axis=-1)`，都得到 `mean` 和 `logvar`。
+- 两者都将 `logvar` clamp 到 `[-30, 20]`。
+- 两者采样公式都是 `z = mean + exp(0.5 * logvar) * standard_normal`。
+- 两者相对标准正态分布的 KL 都是 `0.5 * sum(mean^2 + exp(logvar) - 1 - logvar)`，并对 latent time 和 latent channel 求和、对 batch 求平均。
+- 原版类中的 `kl(other)`、`nll()`、`mode()` 和 `deterministic=True` 分支没有被 MSP Stage-1/Stage-2 当前路径调用，因此未移植这些 API 不改变当前训练和推理行为。
+
+loss reduction：
+- 原版 `L1Loss()` 直接对 batch、action horizon、action dim 全部求平均，KL 对每个样本的全部 latent 求和后再对 batch 求平均。
+- JAX 模型先对 action dim 求平均并返回 `[B, H]`，训练器随后对 `[B, H]` 执行 `jnp.mean`；广播进去的每样本 KL 也随外层 mean 对 batch 求平均。
+- 因此最终优化的标量仍为 `mean(abs(recon-action)) + kl_weight * mean(KL_per_sample)`，与原版一致。
+- TensorBoard 的 `kl_loss` 当前记录未加权原始 KL，与原版 MSP `info['kl_loss']` 一致；总 loss 内仍乘 `kl_weight`。
+
+VAE 结构和原版实际 Hydra 配置的对应：
+- `encoder_dim=128`、`decoder_dim=128`、dropout 0.1、causal encoder/decoder、encoder heads/layers 2/2、decoder heads/layers 4/4、latent dim 16、downsample factor 4、KL weight `1e-6` 均与原版 MSP 配置一致，不应拿 `vae.py` 构造函数中未被实际配置采用的 256、2、`1e-5` 默认值比较。
+- 当前 Pi0.5 适配使用 action horizon 32，因此 latent horizon 为 8；这是当前任务配置选择，需要和 Stage-2 scales 最细尺度 8 保持一致。
+- causal conv、GroupNorm、Mish、pre-norm Transformer、causal decoder query、cross-attention、正弦位置编码、quant/post-quant projection 均已对应移植。
+
+尚未与原版训练 recipe 完全一致的部分：
+- 原版 `train_base.yaml` 的 AdamW 是 `betas=(0.95, 0.999)`、`eps=1e-8`、`weight_decay=0`；当前 OpenPI Stage-1 配置实际是 `betas=(0.9, 0.95)`、`eps=1e-8`、`weight_decay=1e-4`。
+- 原版全局梯度裁剪阈值为 50，当前 OpenPI AdamW 默认阈值为 1。
+- 原版 scheduler 最低学习率为 `1e-5`，当前 Stage-1 配置/脚本使用 `3e-5`；warmup 的表达也不完全相同（原版为总迭代数 1%，当前通常固定 1000 step）。
+- 原版 RoboTwin `LinearNormalizer(mode='limits')` 是范围归一化；当前 Pi0.5 两阶段使用 OpenPI quantile norm stats。这里必须优先保证 Stage-1/Stage-2 相同，不能只把 Stage-1 单独换回原版 MSP normalizer。
+- 以上差异不属于 `DiagonalGaussianDistribution` 缺失，但意味着“VAE 数学逻辑基本一致”不等于“整个训练 recipe 完全一致”。
+
+本轮结论：
+- 没有必要仅为类名一致而新增 `DiagonalGaussianDistribution`；当前公式没有缺失。
+- 如需忠实复刻原版训练 recipe，下一步应在 Stage-1 config 显式调整 AdamW betas、weight decay、gradient clip 和 LR schedule，同时保持两阶段 action normalization 一致。
+
+本轮修改文件：
+- `task.md`

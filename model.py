@@ -90,6 +90,10 @@ class Model(ModelTemplate):
     def __init__(self, model_cfg: dict[str, Any]):
         self.task_name = model_cfg["task_name"]
         self.action_type = model_cfg.get("action_type", "joint")
+        replan_steps = model_cfg.get("replan_steps")
+        self.replan_steps = None if replan_steps is None else int(replan_steps)
+        if self.replan_steps is not None and self.replan_steps <= 0:
+            raise ValueError(f"replan_steps must be positive or null, got {self.replan_steps}.")
         self.robot_action_dim_info = (
             get_robot_action_dim_info(model_cfg["env_cfg_type"]) if model_cfg.get("env_cfg_type") is not None else None
         )
@@ -136,6 +140,8 @@ class Model(ModelTemplate):
         for batch_index, _ in enumerate(env_idx_list):
             single_observation = slice_stacked_obs(self.observation_window, batch_index)
             actions = self.policy.infer(single_observation, **kwargs)["actions"]
+            if self.replan_steps is not None:
+                actions = actions[: self.replan_steps]
             if self.robot_action_dim_info is None:
                 action_list.append(actions)
             else:

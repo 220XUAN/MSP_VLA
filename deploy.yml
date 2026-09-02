@@ -18,5 +18,7 @@ policy_uv_env_path: openpi
 # Must match the config used by train.sh (default OPENPI_TRAIN_CONFIG_NAME).
 train_config_name: pi05_msp_stage2_aloha_arx-x5_seed_0
 repo_id: arx_x5_sim
+# null executes the full predicted chunk. Set to 4 or 8 to diagnose open-loop drift.
+replan_steps: null
 
 port: 6000

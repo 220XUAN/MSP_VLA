@@ -134,23 +134,28 @@ class FakeDataset(Dataset):
 
 
 class ActionOnlyLeRobotDataset(Dataset):
-    """Materialize action chunks from raw LeRobot rows without decoding images."""
+    """Materialize action chunks and current state without decoding images."""
 
     def __init__(self, data_config: _config.DataConfig, action_horizon: int):
         repo_id = data_config.repo_id
         if repo_id is None:
             raise ValueError("Repo ID is not set. Cannot create action-only dataset.")
+        if data_config.action_only_state_key is None:
+            raise ValueError("action_only_state_key is required for action-only delta actions.")
 
         dataset = lerobot_dataset.LeRobotDataset(
             repo_id,
             video_backend=data_config.video_backend,
         )
-        column_names = list(dict.fromkeys([*data_config.action_sequence_keys, "episode_index"]))
+        column_names = list(
+            dict.fromkeys([*data_config.action_sequence_keys, data_config.action_only_state_key, "episode_index"])
+        )
         if hasattr(dataset, "hf_dataset"):
             self._dataset = dataset.hf_dataset.select_columns(column_names)
         else:
             self._dataset = dataset.select_columns(column_names)
         self._action_sequence_keys = tuple(data_config.action_sequence_keys)
+        self._state_key = data_config.action_only_state_key
         self._action_horizon = action_horizon
 
     def _flatten_action(self, row: dict) -> np.ndarray:
@@ -176,7 +181,8 @@ class ActionOnlyLeRobotDataset(Dataset):
                 last_action = action
             action_chunk.append(action)
 
-        return {"actions": np.stack(action_chunk, axis=0)}
+        state = np.asarray(current_row[self._state_key], dtype=np.float32).reshape(-1)
+        return {"state": state, "actions": np.stack(action_chunk, axis=0)}
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -605,20 +611,11 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             if self._data_config.action_only:
-                yield self._make_action_only_observation(batch["actions"]), batch["actions"]
+                yield self._make_action_only_observation(batch["state"]), batch["actions"]
             else:
                 yield _model.Observation.from_dict(batch), batch["actions"]
 
-    def _make_action_only_observation(self, actions):
-        batch_size = actions.shape[0]
-        action_dim = self._model_config.action_dim
-        if isinstance(actions, torch.Tensor):
-            state = torch.zeros((batch_size, action_dim), dtype=torch.float32, device=actions.device)
-        elif isinstance(actions, np.ndarray):
-            state = np.zeros((batch_size, action_dim), dtype=np.float32)
-        else:
-            state = jnp.zeros((batch_size, action_dim), dtype=jnp.float32)
-
+    def _make_action_only_observation(self, state):
         return _model.Observation(
             images={},
             image_masks={},
